@@ -68,6 +68,7 @@
 # Environment overrides (all optional):
 #   MODEL PREFILL_REPLICAS PREFILL_TP DECODE_REPLICAS DECODE_TP
 #   PREFILL_CPU PREFILL_MEM DECODE_CPU DECODE_MEM
+#   PREFILL_GPU_MEM_UTIL  (default 0.85; headroom for cold-start CUDA graph capture)
 #   HF_TOKEN  ROLLOUT_TIMEOUT
 #
 set -uo pipefail
@@ -102,6 +103,14 @@ PREFILL_CPU="${PREFILL_CPU:-}"
 PREFILL_MEM="${PREFILL_MEM:-}"
 DECODE_CPU="${DECODE_CPU:-}"
 DECODE_MEM="${DECODE_MEM:-}"
+
+# The guide's base overlay sets no --gpu-memory-utilization, so vLLM uses its
+# own default (~0.9). That leaves too little headroom for a fresh replica's
+# CUDA-graph capture on cold start: a prefill scale-out under
+# launch-scaledobjects.sh has been observed OOMing at startup with ~77.2GiB/79.18GiB
+# already in use before graph capture even runs. Cap it below the default so a
+# KEDA-triggered scale-out has room to start. Set to empty to keep the guide's default.
+PREFILL_GPU_MEM_UTIL="${PREFILL_GPU_MEM_UTIL:-0.85}"
 
 WORKDIR="${WORKDIR:-${PWD}/.pd-guide-workspace}"
 OVERLAY_DIR="${WORKDIR}/overlay"
@@ -542,9 +551,9 @@ components:
 patches:
 EOF
     _role_patch prefill "$PREFILL_NAME" "$PREFILL_REPLICAS" "$PREFILL_TP" \
-                "$PREFILL_TP_IDX" "$PREFILL_CPU" "$PREFILL_MEM"
+                "$PREFILL_TP_IDX" "$PREFILL_CPU" "$PREFILL_MEM" "$PREFILL_GPU_MEM_UTIL"
     _role_patch decode  "$DECODE_NAME"  "$DECODE_REPLICAS"  "$DECODE_TP" \
-                "$DECODE_TP_IDX"  "$DECODE_CPU"  "$DECODE_MEM"
+                "$DECODE_TP_IDX"  "$DECODE_CPU"  "$DECODE_MEM" ""
   } > "${OVERLAY_DIR}/kustomization.yaml"
 
   kustomize build "$OVERLAY_DIR" > "${WORKDIR}/modelserver.rendered.yaml" \
@@ -556,7 +565,7 @@ EOF
 
 # emit one JSON6902 patch block for a role
 _role_patch() {
-  local role="$1" name="$2" replicas="$3" tp="$4" tpidx="$5" cpu="$6" mem="$7"
+  local role="$1" name="$2" replicas="$3" tp="$4" tpidx="$5" cpu="$6" mem="$7" gpu_mem_util="${8:-}"
   cat <<EOF
   - target:
       kind: Deployment
@@ -593,6 +602,11 @@ EOF
       - op: replace
         path: /spec/template/spec/containers/0/resources/requests/memory
         value: "${mem}"
+EOF
+  [[ -n $gpu_mem_util ]] && cat <<EOF
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --gpu-memory-utilization=${gpu_mem_util}
 EOF
   return 0
 }

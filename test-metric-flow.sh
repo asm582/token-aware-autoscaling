@@ -114,11 +114,38 @@ SA_CA=$(kubectl get secret keda-epp-metrics-reader-token -n "$NAMESPACE" \
 [[ -n $SA_CA    ]] && pass "service-ca.crt injected (signs Thanos's serving cert)" \
                    || fail "service-ca.crt missing — KEDA's TLS verification will fail"
 
+# Portable timeout: prefer GNU coreutils timeout/gtimeout, else a background-kill
+# fallback so this still works on stock macOS. `kubectl run --rm -i` can hang
+# indefinitely waiting on pod scheduling/attach, and this loop calls it once per
+# ScaledObject per sampling round — one stuck call has stalled a whole run before.
+_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    "$@" &
+    local pid=$!
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) &
+    local watcher=$!
+    wait "$pid" 2>/dev/null; local rc=$?
+    kill "$watcher" 2>/dev/null
+    return $rc
+  fi
+}
+
 # Query Thanos from inside the cluster AS THAT SERVICE ACCOUNT.
 thanos_query() {
-  kubectl run "tmf-$RANDOM" --rm -i --restart=Never -n "$NAMESPACE" --image="$CURL_IMAGE" \
+  local pod="tmf-$RANDOM" out rc
+  out=$(_timeout 60 kubectl run "$pod" --rm -i --restart=Never -n "$NAMESPACE" --image="$CURL_IMAGE" \
     --quiet --env="TOK=${SA_TOKEN}" --env="Q=$1" --command -- \
-    sh -c 'curl -sSk --max-time 30 -H "Authorization: Bearer $TOK" --data-urlencode "query=$Q" '"${THANOS}"'/api/v1/query' 2>/dev/null
+    sh -c 'curl -sSk --max-time 30 -H "Authorization: Bearer $TOK" --data-urlencode "query=$Q" '"${THANOS}"'/api/v1/query' 2>/dev/null)
+  rc=$?
+  # on timeout the client-side wait was abandoned; best-effort clean up the pod so it
+  # doesn't linger in the namespace.
+  (( rc != 0 )) && kubectl delete pod "$pod" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
+  printf '%s' "$out"
 }
 # Returns "<series-count> <first-value>" or "ERROR <detail>"
 qsum() {

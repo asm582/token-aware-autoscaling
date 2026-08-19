@@ -75,6 +75,7 @@ OUT="${OUT:-rendered.yaml}"
 DECODE_SIGNAL="${DECODE_SIGNAL:-occupancy}"     # occupancy (summary) | waiters (variant)
 DECODE_THRESHOLD_SET=false                      # tracks an explicit --decode-threshold
 DRY_RUN=false; DELETE=false
+FAILED=0                                        # verification failures; nonzero -> nonzero exit
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -382,8 +383,8 @@ for i in $(seq 1 12); do
   [[ "$KEYS" == *token* && "$KEYS" == *service-ca.crt* ]] && break
   python3 -c "import time; time.sleep(5)"
 done
-[[ "$KEYS" == *token*          ]] && ok "token secret populated"  || warn "token missing — KEDA auth will fail"
-[[ "$KEYS" == *service-ca.crt* ]] && ok "service-ca.crt injected" || warn "service-ca.crt missing"
+[[ "$KEYS" == *token*          ]] && ok "token secret populated"  || { warn "token missing — KEDA auth will fail"; FAILED=$((FAILED+1)); }
+[[ "$KEYS" == *service-ca.crt* ]] && ok "service-ca.crt injected" || { warn "service-ca.crt missing"; FAILED=$((FAILED+1)); }
 
 GOOD=0
 for i in $(seq 1 24); do
@@ -397,10 +398,16 @@ print(n)' 2>/dev/null || echo 0)
   (( GOOD >= 2 )) && break
   python3 -c "import time; time.sleep(10)"
 done
-(( GOOD >= 2 )) && ok "both HPAs report ScalingActive=True ValidMetricFound" \
-                || warn "only ${GOOD}/2 HPAs can read metrics — run ./test-metric-flow.sh for the reason"
+if (( GOOD >= 2 )); then
+  ok "both HPAs report ScalingActive=True ValidMetricFound"
+else
+  warn "only ${GOOD}/2 HPAs can read metrics — run ./test-metric-flow.sh for the reason"
+  FAILED=$((FAILED+1))
+fi
 
 hdr "State"
 oc get scaledobject -n "$NAMESPACE" --no-headers 2>/dev/null | awk '{printf "  %-24s min=%s max=%s ready=%s active=%s\n",$1,$4,$5,$6,$7}'
 oc get hpa          -n "$NAMESPACE" --no-headers 2>/dev/null | awk '{printf "  %-40s targets=%s replicas=%s\n",$1,$3,$7}'
 printf '\n  remove:  ./launch-scaledobjects.sh --delete -p %s\n' "$NAMESPACE"
+(( FAILED > 0 )) && die "${FAILED} verification check(s) failed — ScaledObjects were applied but KEDA cannot read the metrics yet"
+exit 0
