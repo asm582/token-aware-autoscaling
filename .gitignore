@@ -1,0 +1,15 @@
+# Generated at run time — every script rewrites its own outputs.
+# NOTE: .gitignore has no inline comments; a trailing "# ..." becomes part of the
+# pattern and silently matches nothing. Keep comments on their own lines.
+
+# deploy-pd-guide.sh + calibrate-peak-prefill.sh artifacts
+.pd-guide-workspace/
+
+# launch-scaledobjects.sh render (regenerated every run)
+rendered.yaml
+
+# test-metric-flow.sh --probe timelines
+timeline-*.csv
+
+# run-benchmark.sh output (GBs per run) and its `latest` symlink
+benchmark-results/

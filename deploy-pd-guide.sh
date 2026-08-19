@@ -1,0 +1,996 @@
+#!/usr/bin/env bash
+#
+# deploy-pd-guide.sh — deploy the UPSTREAM llm-d P/D disaggregation guide, reproducibly.
+#
+#   https://github.com/llm-d/llm-d/tree/main/guides/pd-disaggregation
+#
+# This follows the guide's own installation path — `helm install` of the
+# llm-d-router-standalone chart, then a kustomize overlay for the model server —
+# rather than going through llm-d-benchmark's `llmdbenchmark standup`. Nothing
+# about the guide's structure is bypassed: the router values, the EPP plugin
+# config, the vLLM args, the NIXL KV-transfer config, the routing sidecar and the
+# guide's own labels all come from the checkout, unedited.
+#
+# ---------------------------------------------------------------------------
+# TWO DEVIATIONS FROM THE GUIDE, AND WHY
+# ---------------------------------------------------------------------------
+#
+# 1. A LOCAL OVERLAY IS REQUIRED — the guide's own instruction cannot work.
+#
+#    The guide says:
+#        export INFRA_PROVIDER=base
+#        kubectl apply -n ${NAMESPACE} -k .../modelserver/gpu/vllm/${INFRA_PROVIDER}
+#
+#    But `modelserver/gpu/vllm/base` renders a literal placeholder:
+#        image: REPLACE_MODEL_SERVER_IMAGE
+#    which the API server rejects. base/kustomization.yaml says so on purpose:
+#        "the model server image component is intentionally not set here.
+#         Each overlay sets its own (e.g. gpu-vllm/release, gpu-vllm/aws-efa)"
+#    Every sibling overlay (coreweave, aws, gke/base) adds
+#    `components/images/gpu-vllm/release`; `base` does not, and there is no OCP
+#    or generic-cluster overlay upstream. So this script generates the missing
+#    overlay: base + the release image component + the topology below. Verify
+#    with `kustomize build llm-d/guides/pd-disaggregation/modelserver/gpu/vllm/base
+#    | grep REPLACE`.
+#
+# 2. MODEL AND TOPOLOGY ARE SCALED TO THIS CLUSTER'S GPU BUDGET.
+#
+#      guide default                    this script
+#      -------------                    -----------
+#      openai/gpt-oss-120b              Qwen/Qwen3-32B
+#      prefill 8 x TP=1  =  8 GPU       prefill 1 x TP=2  = 2 GPU
+#      decode  2 x TP=4  =  8 GPU       decode  1 x TP=2  = 2 GPU
+#      total            = 16 GPU        total             = 4 GPU
+#
+#    Everything else in the pod spec — block size, kv-transfer-config, probes,
+#    cpu/memory, env, volumes, the sidecar — is left at the guide's values, so
+#    what is being tested stays the guide and not a rewrite of it. Each of those
+#    is exposed as an environment variable below if it needs to move.
+#
+# NOT IN SCOPE: monitoring, KEDA ScaledObjects, calibrate.sh, benchmarking. This
+# script deploys the guide and verifies it serves. The EPP keeps the guide's
+# peakPrefillThroughput=33821, which upstream measured on H200/gpt-oss-120b and
+# which is therefore NOT the right figure for Qwen3-32B on H100 — it affects
+# prefix-affinity routing decisions, not whether the stack works.
+#
+# ---------------------------------------------------------------------------
+# USAGE
+# ---------------------------------------------------------------------------
+#   ./deploy-pd-guide.sh                 # full cycle: clean ns -> deploy -> verify
+#   ./deploy-pd-guide.sh --dry-run       # preflight + render + assert, apply nothing
+#   ./deploy-pd-guide.sh --render-only   # render + assert only, no cluster needed
+#   ./deploy-pd-guide.sh --skip-clean    # deploy into the namespace as it is
+#   ./deploy-pd-guide.sh --verify-only   # re-run verification against a live stack
+#   ./deploy-pd-guide.sh --teardown      # helm uninstall + delete namespace
+#   ./deploy-pd-guide.sh --namespace NS  # default pd-test
+#   ./deploy-pd-guide.sh --ref COMMIT    # llm-d checkout ref, default main
+#
+# Environment overrides (all optional):
+#   MODEL PREFILL_REPLICAS PREFILL_TP DECODE_REPLICAS DECODE_TP
+#   PREFILL_CPU PREFILL_MEM DECODE_CPU DECODE_MEM
+#   HF_TOKEN  ROLLOUT_TIMEOUT
+#
+set -uo pipefail
+
+cd "$(dirname "$0")" || exit 1
+
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
+NAMESPACE="${NAMESPACE:-pd-test}"
+GUIDE_NAME="pd-disaggregation"
+LLMD_REPO="https://github.com/llm-d/llm-d.git"
+# Where the llm-d checkout lives. Overridable so the folder can be dropped next to an
+# existing checkout instead of cloning a second copy: LLMD_DIR=/path/to/llm-d ./deploy-pd-guide.sh
+# Default: ./llm-d inside this folder, falling back to ../llm-d when that already exists
+# (the layout in the repo this folder was extracted from).
+if [[ -z ${LLMD_DIR:-} ]]; then
+  if [[ -d "${PWD}/llm-d/.git" ]]; then LLMD_DIR="${PWD}/llm-d"
+  elif [[ -d "${PWD}/../llm-d/.git" ]]; then LLMD_DIR="$(cd "${PWD}/../llm-d" && pwd)"
+  else LLMD_DIR="${PWD}/llm-d"; fi
+fi
+LLMD_REF="${LLMD_REF:-main}"
+
+MODEL="${MODEL:-Qwen/Qwen3-32B}"
+PREFILL_REPLICAS="${PREFILL_REPLICAS:-1}"
+PREFILL_TP="${PREFILL_TP:-2}"
+DECODE_REPLICAS="${DECODE_REPLICAS:-1}"
+DECODE_TP="${DECODE_TP:-2}"
+
+# Left empty => keep whatever the guide sets. Set to override.
+PREFILL_CPU="${PREFILL_CPU:-}"
+PREFILL_MEM="${PREFILL_MEM:-}"
+DECODE_CPU="${DECODE_CPU:-}"
+DECODE_MEM="${DECODE_MEM:-}"
+
+WORKDIR="${WORKDIR:-${PWD}/.pd-guide-workspace}"
+OVERLAY_DIR="${WORKDIR}/overlay"
+ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-2400}"   # first start pulls a ~15GB image and downloads model weights
+CURL_IMAGE="${CURL_IMAGE:-cfmanteiga/alpine-bash-curl-jq}"
+
+DRY_RUN=false
+RENDER_ONLY=false
+SKIP_CLEAN=false
+VERIFY_ONLY=false
+TEARDOWN=false
+
+# ---------------------------------------------------------------------------
+# output helpers
+# ---------------------------------------------------------------------------
+if [[ -t 2 ]]; then B=$'\033[1m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; Z=$'\033[0m'
+else B=; R=; G=; Y=; C=; Z=; fi
+
+stage()  { printf '\n%s══ %s %s\n' "$C$B" "$*" "$Z" >&2; }
+info()   { printf '   %s\n' "$*" >&2; }
+ok()     { printf '   %sPASS%s  %s\n' "$G" "$Z" "$*" >&2; }
+warn()   { printf '   %sWARN%s  %s\n' "$Y" "$Z" "$*" >&2; }
+die()    { printf '\n   %sFAIL%s  %s\n\n' "$R" "$Z" "$*" >&2; exit 1; }
+run()    { info "\$ $*"; if [[ $DRY_RUN == true ]]; then return 0; fi; "$@"; }
+
+usage() { sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//' | head -n -1; exit 0; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)      DRY_RUN=true; shift ;;
+    --render-only)  RENDER_ONLY=true; DRY_RUN=true; shift ;;
+    --skip-clean)   SKIP_CLEAN=true; shift ;;
+    --verify-only)  VERIFY_ONLY=true; SKIP_CLEAN=true; shift ;;
+    --teardown)     TEARDOWN=true; shift ;;
+    --namespace|-n) NAMESPACE="${2:?--namespace needs a value}"; shift 2 ;;
+    --ref)          LLMD_REF="${2:?--ref needs a value}"; shift 2 ;;
+    --model)        MODEL="${2:?--model needs a value}"; shift 2 ;;
+    -h|--help)      usage ;;
+    *)              die "unknown argument: $1  (try --help)" ;;
+  esac
+done
+
+TOTAL_GPUS=$(( PREFILL_REPLICAS * PREFILL_TP + DECODE_REPLICAS * DECODE_TP ))
+mkdir -p "$WORKDIR"
+LOG="${WORKDIR}/deploy.$(date +%Y%m%d-%H%M%S).log"
+
+# =========================================================================
+# STAGE 0 — preflight
+# =========================================================================
+preflight() {
+  stage "STAGE 0  preflight"
+
+  for t in kubectl helm kustomize python3 git; do
+    command -v "$t" >/dev/null 2>&1 || die "missing required tool: $t"
+  done
+  ok "client tools present: kubectl helm kustomize python3 git"
+
+  # Credentials. An expired OCP token surfaces as "the server has asked for the
+  # client to provide credentials" from every subsequent call, so fail here with
+  # something actionable instead of 40 lines of memcache noise.
+  local who
+  who=$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null) \
+    || die "not authenticated to the cluster. Run your 'oc login ...' and retry."
+  [[ -n $who ]] || die "not authenticated to the cluster. Run your 'oc login ...' and retry."
+  ok "authenticated as ${who} @ $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+
+  # Cluster-scoped prerequisites: asserted, never installed. The standalone
+  # router chart renders an InferencePool (inference.networking.k8s.io/v1), so a
+  # missing GAIE CRD makes `helm install` fail halfway with a partial release.
+  if ! kubectl get crd inferencepools.inference.networking.k8s.io >/dev/null 2>&1; then
+    die "GAIE CRDs missing. This script does not install cluster-scoped resources.
+         Someone with cluster-admin must run:
+           kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/latest/download/v1-manifests.yaml"
+  fi
+  local pool_versions
+  pool_versions=$(kubectl get crd inferencepools.inference.networking.k8s.io \
+                    -o jsonpath='{range .spec.versions[*]}{.name}{" "}{end}' 2>/dev/null)
+  [[ $pool_versions == *v1* ]] \
+    || die "InferencePool CRD is served at [${pool_versions}] but the chart needs v1. Upgrade the GAIE CRDs."
+  ok "InferencePool CRD present, versions: ${pool_versions}"
+
+  # The decode pod's routing sidecar is a native sidecar (initContainer with
+  # restartPolicy: Always), which needs the SidecarContainers feature: beta and
+  # on by default in k8s 1.29, GA in 1.33. On an older server the field is
+  # dropped and the init container runs to completion, so the pod never starts.
+  local kmajor kminor
+  kmajor=$(kubectl version -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["serverVersion"]["major"])' 2>/dev/null)
+  kminor=$(kubectl version -o json 2>/dev/null | python3 -c 'import json,sys; import re; print(re.sub(r"[^0-9]","",json.load(sys.stdin)["serverVersion"]["minor"]))' 2>/dev/null)
+  if [[ -n ${kminor:-} ]]; then
+    if (( kmajor > 1 || kminor >= 29 )); then
+      ok "server is k8s ${kmajor}.${kminor} — native sidecar containers supported"
+    else
+      die "server is k8s ${kmajor}.${kminor}; the guide's decode routing sidecar needs >= 1.29"
+    fi
+  else
+    warn "could not read the server version; assuming native sidecars are supported"
+  fi
+
+  # Namespace-scoped authority in the target namespace.
+  if [[ $DRY_RUN == false ]]; then
+    kubectl auth can-i create deployments -n "$NAMESPACE" >/dev/null 2>&1 \
+      || die "cannot create deployments in namespace ${NAMESPACE}"
+    ok "can create workloads in ${NAMESPACE}"
+  fi
+
+  # GPU capacity. Tensor parallelism is intra-node: a TP=N pod needs N free GPUs
+  # on ONE node, so a cluster-wide free count can look sufficient while nothing
+  # schedules. This computes free GPUs per node and bin-packs the requested pods.
+  if [[ $VERIFY_ONLY == false ]]; then
+    check_gpu_capacity
+  fi
+}
+
+check_gpu_capacity() {
+  local nodes pods
+  nodes=$(kubectl get nodes -o json 2>/dev/null) || die "cannot list nodes"
+  pods=$(kubectl get pods -A --field-selector=status.phase!=Succeeded,status.phase!=Failed -o json 2>/dev/null) \
+    || die "cannot list pods (needed to compute free GPUs)"
+
+  printf '%s' "$nodes" > "${WORKDIR}/nodes.json"
+  printf '%s' "$pods"  > "${WORKDIR}/pods.json"
+
+  python3 - "$PREFILL_REPLICAS" "$PREFILL_TP" "$DECODE_REPLICAS" "$DECODE_TP" \
+           "${WORKDIR}/nodes.json" "${WORKDIR}/pods.json" <<'PY' >&2
+import json, sys
+pr, ptp, dr, dtp = (int(x) for x in sys.argv[1:5])
+nodes = json.load(open(sys.argv[5]))
+pods  = json.load(open(sys.argv[6]))
+GPU = "nvidia.com/gpu"
+
+free, eph = {}, {}
+for n in nodes["items"]:
+    name = n["metadata"]["name"]
+    alloc = n.get("status", {}).get("allocatable", {})
+    if GPU not in alloc:
+        continue
+    ready = any(c["type"] == "Ready" and c["status"] == "True"
+                for c in n.get("status", {}).get("conditions", []))
+    sched = not n.get("spec", {}).get("unschedulable", False)
+    if not (ready and sched):
+        continue
+    free[name] = int(alloc[GPU])
+    eph[name] = alloc.get("ephemeral-storage", "?")
+
+for p in pods["items"]:
+    node = p.get("spec", {}).get("nodeName")
+    if node not in free:
+        continue
+    for c in p["spec"].get("containers", []):
+        req = c.get("resources", {}).get("requests", {}) or {}
+        lim = c.get("resources", {}).get("limits", {}) or {}
+        free[node] -= int(req.get(GPU, lim.get(GPU, 0)) or 0)
+
+# bin-pack: schedule the biggest TP first, it is the hardest to place
+want = [("decode", dtp)] * dr + [("prefill", ptp)] * pr
+want.sort(key=lambda x: -x[1])
+avail = dict(free)
+placed, failed = [], []
+for role, tp in want:
+    fit = sorted((v, k) for k, v in avail.items() if v >= tp)
+    if not fit:
+        failed.append((role, tp)); continue
+    _, node = fit[0]          # tightest fit that still holds it
+    avail[node] -= tp
+    placed.append((role, tp, node))
+
+total_free = sum(v for v in free.values() if v > 0)
+print(f"   GPU nodes: {len(free)}, free GPUs cluster-wide: {total_free}")
+for k in sorted(free, key=lambda k: -free[k])[:8]:
+    if free[k] > 0:
+        print(f"     {k:<48} free={free[k]:<3} ephemeral-storage={eph[k]}")
+for role, tp, node in placed:
+    print(f"   place {role:<8} TP={tp} -> {node}")
+if failed:
+    for role, tp in failed:
+        print(f"   NO NODE with {tp} free GPUs for {role} (TP is intra-node)")
+    sys.exit(1)
+PY
+  # shellcheck disable=SC2181
+  if [[ $? -ne 0 ]]; then
+    die "insufficient free GPUs on a single node for the requested topology (${TOTAL_GPUS} GPU total)"
+  fi
+  ok "topology fits: prefill ${PREFILL_REPLICAS}xTP${PREFILL_TP} + decode ${DECODE_REPLICAS}xTP${DECODE_TP} = ${TOTAL_GPUS} GPU"
+
+  # The guide mounts emptyDir at /.cache, so every pod downloads its own copy of
+  # the weights to node ephemeral storage. Qwen3-32B is ~65GB per pod.
+  warn "the guide uses no model PVC: each of the $((PREFILL_REPLICAS + DECODE_REPLICAS)) pods downloads its own"
+  warn "  copy of ${MODEL} (~65GB) to node ephemeral storage via the emptyDir at /.cache"
+}
+
+# =========================================================================
+# STAGE 1 — llm-d checkout at a known ref
+# =========================================================================
+checkout_repo() {
+  stage "STAGE 1  llm-d checkout @ ${LLMD_REF}"
+
+  if [[ ! -d "${LLMD_DIR}/.git" ]]; then
+    info "cloning ${LLMD_REPO} into ${LLMD_DIR}"
+    [[ $DRY_RUN == true ]] || git clone --quiet "$LLMD_REPO" "$LLMD_DIR" \
+      || die "git clone failed"
+  fi
+
+  if [[ $DRY_RUN == false ]]; then
+    git -C "$LLMD_DIR" fetch --quiet origin "$LLMD_REF" 2>/dev/null \
+      || git -C "$LLMD_DIR" fetch --quiet origin \
+      || warn "git fetch failed; using the checkout as-is"
+    # Detach so the tree is exactly the requested ref, whatever was there before.
+    git -C "$LLMD_DIR" checkout --quiet --detach FETCH_HEAD 2>/dev/null \
+      || git -C "$LLMD_DIR" checkout --quiet --detach "$LLMD_REF" \
+      || die "cannot check out ref ${LLMD_REF}"
+    local dirty
+    dirty=$(git -C "$LLMD_DIR" status --porcelain | head -5)
+    [[ -z $dirty ]] || { warn "checkout has local modifications:"; printf '     %s\n' "$dirty" >&2; }
+  fi
+
+  REPO_ROOT="$LLMD_DIR"
+  export REPO_ROOT
+  # shellcheck source=/dev/null
+  source "${REPO_ROOT}/guides/env.sh" || die "cannot source guides/env.sh"
+
+  GUIDE_DIR="${REPO_ROOT}/guides/${GUIDE_NAME}"
+  [[ -d $GUIDE_DIR ]] || die "guide directory not found: ${GUIDE_DIR}"
+
+  info "commit:              $(git -C "$LLMD_DIR" log -1 --format='%h %ad %s' --date=short 2>/dev/null)"
+  info "ROUTER_CHART:        ${ROUTER_STANDALONE_CHART} @ ${ROUTER_CHART_VERSION}"
+  info "GAIE CRD source:     ${GAIE_URL}"
+  ok "guide checked out"
+}
+
+# =========================================================================
+# STAGE 2 — clean namespace
+# =========================================================================
+clean_namespace() {
+  stage "STAGE 2  clean namespace ${NAMESPACE}"
+
+  if [[ $SKIP_CLEAN == true ]]; then
+    warn "--skip-clean: leaving existing namespace contents in place"
+    run kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml \
+      > "${WORKDIR}/ns.yaml" 2>/dev/null
+    [[ $DRY_RUN == true ]] || kubectl apply -f "${WORKDIR}/ns.yaml" >/dev/null
+    return 0
+  fi
+
+  if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+    info "namespace exists; deleting it so the guide deploys onto nothing"
+    if [[ $DRY_RUN == false ]]; then
+      # helm uninstall first: leaving the release record behind makes a later
+      # `helm install` of the same name fail even though the objects are gone.
+      helm uninstall "$GUIDE_NAME" -n "$NAMESPACE" --wait --timeout 3m >/dev/null 2>&1 || true
+      kubectl delete namespace "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
+      local waited=0
+      while kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; do
+        (( waited >= 600 )) && die "namespace ${NAMESPACE} stuck terminating after 600s (check finalizers)"
+        sleep 5; waited=$((waited + 5))
+        (( waited % 30 == 0 )) && info "  still terminating (${waited}s)"
+      done
+      info "namespace deleted after ${waited}s"
+    fi
+  else
+    info "namespace does not exist yet"
+  fi
+
+  if [[ $DRY_RUN == false ]]; then
+    kubectl create namespace "$NAMESPACE" >/dev/null || die "cannot create namespace ${NAMESPACE}"
+  fi
+  ok "namespace ${NAMESPACE} is clean"
+}
+
+# =========================================================================
+# STAGE 3 — HF token secret (guide prerequisite)
+# =========================================================================
+create_hf_secret() {
+  stage "STAGE 3  llm-d-hf-token secret"
+
+  local tok="${HF_TOKEN:-${LLMDBENCH_HF_TOKEN:-}}"
+  if [[ -z $tok ]]; then
+    # The deployments reference the secret unconditionally, so it must exist or
+    # every pod fails with CreateContainerConfigError. Qwen3-32B is not gated,
+    # so an empty value is enough to pull it.
+    warn "HF_TOKEN not set; creating the secret with an empty value"
+    warn "  ${MODEL} is not gated so this is fine, but a gated model would 401"
+    tok=""
+  fi
+
+  if [[ $DRY_RUN == false ]]; then
+    kubectl create secret generic llm-d-hf-token \
+      --from-literal="HF_TOKEN=${tok}" -n "$NAMESPACE" \
+      --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+      || die "cannot create llm-d-hf-token secret"
+  fi
+  ok "secret llm-d-hf-token present in ${NAMESPACE}"
+}
+
+# =========================================================================
+# STAGE 4 — router (guide step 1, standalone mode, values verbatim)
+# =========================================================================
+install_router() {
+  stage "STAGE 4  llm-d Router (standalone)"
+
+  local base_values="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
+  local guide_values="${GUIDE_DIR}/router/${GUIDE_NAME}.values.yaml"
+  [[ -f $base_values  ]] || die "missing ${base_values}"
+  [[ -f $guide_values ]] || die "missing ${guide_values}"
+
+  # Record what the EPP will actually run with, so a later "why did it route
+  # that way" question has an artifact to read instead of a guess.
+  if [[ $DRY_RUN == false ]]; then
+    helm template "$GUIDE_NAME" "$ROUTER_STANDALONE_CHART" \
+      -f "$base_values" -f "$guide_values" \
+      -n "$NAMESPACE" --version "$ROUTER_CHART_VERSION" \
+      > "${WORKDIR}/router.rendered.yaml" 2>/dev/null \
+      || die "helm template of the router chart failed"
+    python3 - "${WORKDIR}/router.rendered.yaml" "${WORKDIR}/pd-config.yaml" <<'PY' >&2
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+cfg = None
+for d in docs:
+    if d.get("kind") == "ConfigMap":
+        for k, v in (d.get("data") or {}).items():
+            if k.endswith("pd-config.yaml"):
+                cfg = v
+if cfg is None:
+    print("   WARN  no pd-config.yaml in the rendered chart"); sys.exit(0)
+open(sys.argv[2], "w").write(cfg)
+parsed = yaml.safe_load(cfg)
+plugins = [p["type"] for p in parsed.get("plugins", [])]
+print(f"   EPP plugins ({len(plugins)}): {', '.join(plugins)}")
+for p in parsed.get("plugins", []):
+    ppt = (p.get("parameters") or {}).get("peakPrefillThroughput")
+    if ppt is not None:
+        print(f"   peakPrefillThroughput = {ppt}   (guide value, measured upstream on H200/gpt-oss-120b)")
+for prof in parsed.get("schedulingProfiles", []):
+    refs = [x["pluginRef"] for x in prof.get("plugins", [])]
+    print(f"   profile {prof['name']:<8} {' -> '.join(refs)}")
+PY
+  fi
+
+  # The guide's install command, unmodified.
+  if helm status "$GUIDE_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
+    info "release ${GUIDE_NAME} already exists; upgrading in place"
+    run helm upgrade "$GUIDE_NAME" "$ROUTER_STANDALONE_CHART" \
+      -f "$base_values" -f "$guide_values" \
+      -n "$NAMESPACE" --version "$ROUTER_CHART_VERSION" --wait --timeout 5m \
+      || die "helm upgrade failed"
+  else
+    run helm install "$GUIDE_NAME" "$ROUTER_STANDALONE_CHART" \
+      -f "$base_values" -f "$guide_values" \
+      -n "$NAMESPACE" --version "$ROUTER_CHART_VERSION" --wait --timeout 5m \
+      || die "helm install of the router failed"
+  fi
+  ok "router installed"
+}
+
+# =========================================================================
+# STAGE 5 — model server overlay: generate, assert, apply (guide step 2)
+# =========================================================================
+BASE_OVERLAY=
+render_overlay() {
+  stage "STAGE 5  model server overlay"
+
+  BASE_OVERLAY="${GUIDE_DIR}/modelserver/gpu/vllm/base"
+  [[ -d $BASE_OVERLAY ]] || die "missing ${BASE_OVERLAY}"
+
+  # Prove the deviation is necessary rather than asserting it in a comment.
+  if kustomize build "$BASE_OVERLAY" 2>/dev/null | grep -q 'REPLACE_MODEL_SERVER_IMAGE'; then
+    info "confirmed: 'kubectl apply -k .../vllm/base' would apply image: REPLACE_MODEL_SERVER_IMAGE"
+    info "           -> layering components/images/gpu-vllm/release, as every sibling overlay does"
+  else
+    warn "the base overlay no longer emits REPLACE_MODEL_SERVER_IMAGE — upstream may have fixed this;"
+    warn "  re-read the guide before trusting this script's overlay"
+  fi
+
+  mkdir -p "$OVERLAY_DIR"
+  kustomize build "$BASE_OVERLAY" > "${WORKDIR}/base.rendered.yaml" 2>/dev/null \
+    || die "kustomize build of the guide's base overlay failed"
+
+  # Discover the deployment names (the base applies a namePrefix) and the index
+  # of --tensor-parallel-size inside args, so the JSON patches below do not
+  # depend on upstream keeping its current argument order.
+  python3 - "${WORKDIR}/base.rendered.yaml" > "${WORKDIR}/targets.env" <<'PY' || die "cannot inspect the base render"
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+out = {}
+for d in docs:
+    if d.get("kind") != "Deployment":
+        continue
+    name = d["metadata"]["name"]
+    role = "PREFILL" if name.endswith("prefill") else "DECODE" if name.endswith("decode") else None
+    if not role:
+        continue
+    c = d["spec"]["template"]["spec"]["containers"][0]
+    args = c.get("args", [])
+    tp = [i for i, a in enumerate(args) if str(a).startswith("--tensor-parallel-size")]
+    if not tp:
+        sys.exit(f"no --tensor-parallel-size arg on {name}")
+    out[f"{role}_NAME"] = name
+    out[f"{role}_TP_IDX"] = tp[0]
+    out[f"{role}_MODEL_IDX"] = 0     # vllm serve <model> is positional
+    out[f"{role}_BASE_MODEL"] = args[0]
+for k in ("PREFILL_NAME", "DECODE_NAME"):
+    if k not in out:
+        sys.exit(f"could not find the {k.split('_')[0].lower()} Deployment in the base render")
+for k, v in out.items():
+    print(f"{k}={v}")
+PY
+  # shellcheck source=/dev/null
+  source "${WORKDIR}/targets.env"
+  info "base deployments:    ${PREFILL_NAME}, ${DECODE_NAME}"
+  info "guide's model:       ${PREFILL_BASE_MODEL}  ->  ${MODEL}"
+
+  # relpath must be computed from RESOLVED paths: kustomize resolves symlinks before
+  # loading a resource, so a logical relative path breaks wherever a symlinked parent is
+  # involved (on macOS /tmp -> /private/tmp, which turned ../../../../Users/... into
+  # /private/Users/... and failed with "evalsymlink failure").
+  local relpath_py='import os,sys; print(os.path.relpath(os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])))'
+  local rel_base rel_component
+  rel_base=$(python3 -c "$relpath_py" "$BASE_OVERLAY" "$OVERLAY_DIR")
+  rel_component=$(python3 -c "$relpath_py" \
+                "${REPO_ROOT}/guides/recipes/modelserver/components/images/gpu-vllm/release" "$OVERLAY_DIR")
+
+  {
+    cat <<EOF
+# GENERATED by deploy-pd-guide.sh — do not edit, it is rewritten every run.
+#
+# The guide's own overlay (${rel_base}) plus:
+#   * the model server image component, which base deliberately omits and every
+#     sibling overlay (coreweave/aws/gke) supplies
+#   * this cluster's topology: ${MODEL}, prefill ${PREFILL_REPLICAS}xTP${PREFILL_TP}, decode ${DECODE_REPLICAS}xTP${DECODE_TP}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ${rel_base}
+
+components:
+  - ${rel_component}
+
+patches:
+EOF
+    _role_patch prefill "$PREFILL_NAME" "$PREFILL_REPLICAS" "$PREFILL_TP" \
+                "$PREFILL_TP_IDX" "$PREFILL_CPU" "$PREFILL_MEM"
+    _role_patch decode  "$DECODE_NAME"  "$DECODE_REPLICAS"  "$DECODE_TP" \
+                "$DECODE_TP_IDX"  "$DECODE_CPU"  "$DECODE_MEM"
+  } > "${OVERLAY_DIR}/kustomization.yaml"
+
+  kustomize build "$OVERLAY_DIR" > "${WORKDIR}/modelserver.rendered.yaml" \
+    || die "kustomize build of the generated overlay failed"
+  ok "overlay rendered -> ${WORKDIR}/modelserver.rendered.yaml"
+
+  assert_render
+}
+
+# emit one JSON6902 patch block for a role
+_role_patch() {
+  local role="$1" name="$2" replicas="$3" tp="$4" tpidx="$5" cpu="$6" mem="$7"
+  cat <<EOF
+  - target:
+      kind: Deployment
+      name: ${name}
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: ${replicas}
+      - op: replace
+        path: /spec/template/spec/containers/0/args/0
+        value: ${MODEL}
+      - op: replace
+        path: /spec/template/spec/containers/0/args/${tpidx}
+        value: --tensor-parallel-size=${tp}
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/nvidia.com~1gpu
+        value: "${tp}"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/nvidia.com~1gpu
+        value: "${tp}"
+EOF
+  [[ -n $cpu ]] && cat <<EOF
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: "${cpu}"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: "${cpu}"
+EOF
+  [[ -n $mem ]] && cat <<EOF
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: "${mem}"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: "${mem}"
+EOF
+  return 0
+}
+
+# The rendered manifest is the last artifact before the cluster sees anything,
+# so every property the topology depends on is asserted here. A silently wrong
+# render is the failure mode that costs the most time downstream.
+assert_render() {
+  python3 - "${WORKDIR}/modelserver.rendered.yaml" \
+      "$MODEL" "$PREFILL_REPLICAS" "$PREFILL_TP" "$DECODE_REPLICAS" "$DECODE_TP" <<'PY' >&2 \
+    || die "the rendered manifest does not match the requested topology — nothing applied"
+import sys, yaml
+path, model = sys.argv[1], sys.argv[2]
+pr, ptp, dr, dtp = (int(x) for x in sys.argv[3:7])
+want = {"prefill": (pr, ptp), "decode": (dr, dtp)}
+docs = [d for d in yaml.safe_load_all(open(path)) if d]
+raw = open(path).read()
+bad, seen = [], {}
+
+if "REPLACE_" in raw:
+    bad.append("rendered manifest still contains a REPLACE_ placeholder")
+
+for d in docs:
+    if d.get("kind") != "Deployment":
+        continue
+    name = d["metadata"]["name"]
+    role = "prefill" if name.endswith("prefill") else "decode" if name.endswith("decode") else None
+    if not role:
+        continue
+    seen[role] = name
+    spec = d["spec"]
+    ms = [c for c in spec["template"]["spec"]["containers"] if c["name"] == "modelserver"]
+    if not ms:
+        bad.append(f"{role}: no container named modelserver"); continue
+    c, args = ms[0], ms[0].get("args", [])
+    wrep, wtp = want[role]
+
+    got_rep = spec.get("replicas")
+    got_model = args[0] if args else None
+    got_tp = next((a.split("=", 1)[1] for a in args if str(a).startswith("--tensor-parallel-size")), None)
+    lim = c["resources"]["limits"]; req = c["resources"]["requests"]
+    got_gpu_l, got_gpu_r = lim.get("nvidia.com/gpu"), req.get("nvidia.com/gpu")
+    img = c.get("image", "")
+    kv = next((args[i+1] for i, a in enumerate(args) if a == "--kv-transfer-config"), None)
+    pod = spec["template"]["spec"]
+    # The routing sidecar is a NATIVE Kubernetes sidecar: an initContainer with
+    # restartPolicy: Always (k8s >= 1.29), not a regular container. Looking only
+    # at .containers finds nothing and the check silently passes on a broken pod.
+    sidecars = [x["name"] for x in pod.get("containers", []) if x["name"] != "modelserver"] + \
+               [x["name"] + "(init,restart=" + str(x.get("restartPolicy")) + ")"
+                for x in pod.get("initContainers", [])]
+
+    if got_rep != wrep:            bad.append(f"{role}: replicas={got_rep}, want {wrep}")
+    if got_model != model:         bad.append(f"{role}: model={got_model}, want {model}")
+    if got_tp != str(wtp):         bad.append(f"{role}: tensor-parallel-size={got_tp}, want {wtp}")
+    if str(got_gpu_l) != str(wtp): bad.append(f"{role}: gpu limit={got_gpu_l}, want {wtp}")
+    if str(got_gpu_r) != str(wtp): bad.append(f"{role}: gpu request={got_gpu_r}, want {wtp}")
+    if not img or "REPLACE" in img: bad.append(f"{role}: unusable image {img!r}")
+    if not kv or "NixlConnector" not in kv:
+        bad.append(f"{role}: kv-transfer-config missing NixlConnector: {kv!r}")
+
+    print(f"   {role:<8} replicas={got_rep} tp={got_tp} gpu={got_gpu_l} "
+          f"kv=NixlConnector sidecars={sidecars or '-'}")
+    print(f"   {'':<8} image={img}")
+
+for role in ("prefill", "decode"):
+    if role not in seen:
+        bad.append(f"no {role} Deployment in the render")
+
+# The decode pod must carry the routing sidecar: it is what calls the prefill
+# pod named in the EPP's header and pulls the KV cache back over NIXL. Without
+# it the deployment comes up healthy and silently never disaggregates.
+for d in docs:
+    if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("decode"):
+        pod = d["spec"]["template"]["spec"]
+        allc = pod.get("containers", []) + pod.get("initContainers", [])
+        proxy = [c for c in allc if "proxy" in c["name"] or "sidecar" in c["name"]]
+        if not proxy:
+            bad.append("decode has no routing sidecar: " + str([c["name"] for c in allc]))
+        else:
+            pc = proxy[0]
+            init_names = [c["name"] for c in pod.get("initContainers", [])]
+            # A native sidecar without restartPolicy: Always runs to completion
+            # and the pod never starts; with it, it stays up alongside vLLM.
+            if pc["name"] in init_names and pc.get("restartPolicy") != "Always":
+                bad.append("decode sidecar " + pc["name"] + " is an initContainer "
+                           "without restartPolicy: Always")
+            kvc = [a for a in pc.get("args", []) if "kv-connector" in str(a)]
+            print("   sidecar  " + pc["name"] + " image=" + pc.get("image", "?")
+                  + " " + " ".join(kvc))
+
+if bad:
+    print("\n   rendered manifest assertions FAILED:")
+    for b in bad:
+        print(f"     - {b}")
+    sys.exit(1)
+print("   all render assertions passed")
+PY
+  ok "render matches the requested topology"
+}
+
+apply_modelserver() {
+  stage "STAGE 6  apply model server"
+  # Equivalent to the guide's `kubectl apply -k <overlay>`, except the exact
+  # bytes that were just asserted are what get applied.
+  run kubectl apply -n "$NAMESPACE" -f "${WORKDIR}/modelserver.rendered.yaml" \
+    || die "kubectl apply of the model server failed"
+  ok "model server applied"
+}
+
+# =========================================================================
+# STAGE 7 — wait for readiness
+# =========================================================================
+wait_ready() {
+  stage "STAGE 7  wait for pods (timeout ${ROLLOUT_TIMEOUT}s)"
+  [[ $DRY_RUN == true ]] && { warn "--dry-run: not waiting"; return 0; }
+
+  local deploys waited=0 interval=15
+  deploys=$(kubectl get deploy -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}')
+  info "deployments: ${deploys}"
+
+  while :; do
+    local all_ready=true line=""
+    for d in $deploys; do
+      local want got
+      want=$(kubectl get deploy "$d" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null)
+      got=$(kubectl get deploy "$d" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+      got=${got:-0}
+      line+="${d}=${got}/${want} "
+      [[ ${got:-0} -lt ${want:-1} ]] && all_ready=false
+    done
+
+    if [[ $all_ready == true ]]; then
+      ok "all pods ready after ${waited}s  (${line})"
+      return 0
+    fi
+
+    # Surface hard failures immediately instead of burning the whole timeout.
+    local broken
+    broken=$(kubectl get pods -n "$NAMESPACE" -o json | python3 -c '
+import json, sys
+bad = []
+FATAL = ("ErrImagePull", "ImagePullBackOff", "CrashLoopBackOff",
+         "CreateContainerConfigError", "CreateContainerError", "InvalidImageName")
+for p in json.load(sys.stdin)["items"]:
+    n = p["metadata"]["name"]
+    st = p.get("status", {})
+    for cs in (st.get("containerStatuses") or []) + (st.get("initContainerStatuses") or []):
+        cn = cs.get("name", "?")
+        w = cs.get("state", {}).get("waiting") or {}
+        t = cs.get("lastState", {}).get("terminated") or {}
+        if w.get("reason") in FATAL:
+            bad.append(n + "/" + cn + ": " + w["reason"] + " " + w.get("message", "")[:160])
+        elif t.get("reason") == "OOMKilled":
+            bad.append(n + "/" + cn + ": OOMKilled (raise the memory limit)")
+    if st.get("phase") == "Pending":
+        for c in (st.get("conditions") or []):
+            if c.get("reason") == "Unschedulable":
+                bad.append(n + ": Unschedulable " + c.get("message", "")[:160])
+print("\n".join(bad))')
+    if [[ -n $broken ]]; then
+      printf '     %s\n' "$broken" >&2
+      dump_diagnostics
+      die "pods are failing, not just slow (see above)"
+    fi
+
+    (( waited >= ROLLOUT_TIMEOUT )) && { dump_diagnostics; die "timed out after ${waited}s (${line})"; }
+    (( waited % 60 == 0 )) && info "  ${waited}s  ${line}"
+    sleep $interval; waited=$((waited + interval))
+  done
+}
+
+dump_diagnostics() {
+  local out="${WORKDIR}/diagnostics.$(date +%H%M%S).txt"
+  {
+    echo "=== pods ===";   kubectl get pods -n "$NAMESPACE" -o wide
+    echo; echo "=== events ==="; kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -40
+    for p in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null); do
+      echo; echo "=== describe ${p} ==="; kubectl describe -n "$NAMESPACE" "$p" | tail -30
+      echo; echo "=== logs ${p} (last 60) ==="
+      kubectl logs -n "$NAMESPACE" "$p" --all-containers --tail=60 2>&1 | tail -60
+    done
+  } > "$out" 2>&1
+  warn "diagnostics written to ${out}"
+  kubectl get pods -n "$NAMESPACE" -o wide >&2 2>/dev/null
+}
+
+# =========================================================================
+# STAGE 8 — verification (the guide's own, plus a P/D assertion)
+# =========================================================================
+verify() {
+  stage "STAGE 8  verification"
+  [[ $DRY_RUN == true ]] && { warn "--dry-run: not verifying"; return 0; }
+
+  # 8a — the guide's step 1: resolve the standalone endpoint.
+  local ip
+  ip=$(kubectl get service "${GUIDE_NAME}-epp" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}' 2>/dev/null) \
+    || die "service ${GUIDE_NAME}-epp not found"
+  [[ -n $ip && $ip != None ]] || die "service ${GUIDE_NAME}-epp has no clusterIP"
+  ok "endpoint (standalone): http://${ip}"
+
+  # 8b — the guide runs ONE InferencePool holding both roles; prefill-filter and
+  # decode-filter split it by the llm-d.ai/role label. So the check that matters
+  # is not "are there endpoints" (the model servers have no Service at all —
+  # GAIE selects pods directly) but "does the pool select at least one ready pod
+  # of EACH role". Miss a role and requests 503 while every pod looks healthy.
+  local pool sel
+  pool=$(kubectl get inferencepool -n "$NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  [[ -n $pool ]] || die "no InferencePool in ${NAMESPACE} — the router chart did not install cleanly"
+  sel=$(kubectl get inferencepool "$pool" -n "$NAMESPACE" \
+        -o jsonpath='{range .spec.selector.matchLabels}{@}{end}' 2>/dev/null)
+  sel=$(kubectl get inferencepool "$pool" -n "$NAMESPACE" -o json 2>/dev/null | python3 -c '
+import json, sys
+ml = json.load(sys.stdin)["spec"]["selector"]["matchLabels"]
+print(",".join(k + "=" + v for k, v in ml.items()))')
+  info "InferencePool ${pool} selects: ${sel}"
+
+  local roles
+  roles=$(kubectl get pods -n "$NAMESPACE" -l "$sel" -o json 2>/dev/null | python3 -c '
+import json, sys
+from collections import Counter
+c = Counter()
+for p in json.load(sys.stdin)["items"]:
+    role = p["metadata"]["labels"].get("llm-d.ai/role", "<none>")
+    ready = any(cd["type"] == "Ready" and cd["status"] == "True"
+                for cd in (p.get("status", {}).get("conditions") or []))
+    if ready:
+        c[role] += 1
+print(" ".join(f"{k}={v}" for k, v in sorted(c.items())) or "NONE")
+print(",".join(sorted(c)))')
+  local counts pool_roles
+  counts=$(printf '%s' "$roles" | head -1)
+  pool_roles=$(printf '%s' "$roles" | tail -1)
+  info "ready pods in the pool: ${counts}"
+  [[ $pool_roles == *prefill* ]] || die "the InferencePool selects no ready prefill pod — P/D cannot route"
+  [[ $pool_roles == *decode*  ]] || die "the InferencePool selects no ready decode pod — P/D cannot route"
+  ok "pool holds both roles, as prefill-filter/decode-filter require"
+
+  # 8c — mark the prefill log position, so 8e can tell whether THIS request
+  # went through prefill rather than reading a stale line.
+  local prefill_pod decode_pod
+  prefill_pod=$(kubectl get pods -n "$NAMESPACE" -l llm-d.ai/role=prefill \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  [[ -n $prefill_pod ]] || prefill_pod=$(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null \
+                  | grep -m1 prefill | cut -d/ -f2)
+  decode_pod=$(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null | grep -m1 decode | cut -d/ -f2)
+  info "prefill pod: ${prefill_pod:-<none>}"
+  info "decode pod:  ${decode_pod:-<none>}"
+  local prefill_lines_before=0
+  [[ -n $prefill_pod ]] && prefill_lines_before=$(kubectl logs -n "$NAMESPACE" "$prefill_pod" \
+      -c modelserver 2>/dev/null | wc -l | tr -d ' ')
+
+  # 8d — the guide's step 2: send a completion request from inside the cluster.
+  info "sending POST /v1/completions from an in-cluster pod"
+  local resp
+  resp=$(kubectl run "pd-verify-$$" --rm -i --restart=Never -n "$NAMESPACE" \
+           --image="$CURL_IMAGE" --quiet --command -- \
+           sh -c "curl -sS -m 180 -w '\nHTTP_CODE:%{http_code}\n' -X POST http://${ip}/v1/completions \
+                  -H 'Content-Type: application/json' \
+                  -d '{\"model\":\"${MODEL}\",\"prompt\":\"How are you today?\",\"max_tokens\":32}'" 2>&1)
+  printf '%s\n' "$resp" > "${WORKDIR}/verify.response.txt"
+
+  local code
+  code=$(printf '%s' "$resp" | sed -n 's/^HTTP_CODE:\([0-9]*\)$/\1/p' | tail -1)
+  if [[ $code != 200 ]]; then
+    printf '%s\n' "$resp" | tail -20 >&2
+    dump_diagnostics
+    die "completion request returned HTTP ${code:-<none>} (full body in ${WORKDIR}/verify.response.txt)"
+  fi
+
+  local text
+  text=$(printf '%s' "$resp" | sed '/^HTTP_CODE:/d' | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+i = raw.find("{")
+try:
+    d = json.loads(raw[i:])
+    print(d["choices"][0].get("text", "")[:200].replace("\n", " "))
+except Exception as e:
+    print("")' 2>/dev/null)
+  [[ -n $text ]] || { printf '%s\n' "$resp" | tail -20 >&2; die "HTTP 200 but no completion text in the response"; }
+  ok "HTTP 200, completion returned: \"${text}\""
+
+  # 8e — did it actually disaggregate? A P/D stack that quietly serves
+  # everything from decode passes 8d and is still broken. Prefill's access log
+  # is enabled for /v1/completions (only /health,/metrics,/v1/models are muted),
+  # so a new prefill log line for this request is direct evidence.
+  if [[ -n $prefill_pod ]]; then
+    sleep 3
+    local after new
+    after=$(kubectl logs -n "$NAMESPACE" "$prefill_pod" -c modelserver 2>/dev/null | wc -l | tr -d ' ')
+    new=$(kubectl logs -n "$NAMESPACE" "$prefill_pod" -c modelserver --tail=$(( after - prefill_lines_before < 1 ? 1 : after - prefill_lines_before )) 2>/dev/null)
+    if printf '%s' "$new" | grep -qE 'POST /v1/(completions|chat/completions)|Received request'; then
+      ok "prefill pod served this request — disaggregation is live"
+    else
+      warn "no new prefill activity observed for this request; it may have been served"
+      warn "  without disaggregating. Check: kubectl logs -n ${NAMESPACE} ${decode_pod} -c routing-proxy"
+    fi
+  fi
+
+  # 8f — the decode sidecar is the component that pulls KV over NIXL; an error
+  # there is the classic silent P/D failure.
+  if [[ -n $decode_pod ]]; then
+    local sc
+    sc=$(kubectl get pod "$decode_pod" -n "$NAMESPACE" \
+          -o jsonpath='{range .spec.containers[*]}{.name}{" "}{end}{range .spec.initContainers[*]}{.name}{"(sidecar) "}{end}' 2>/dev/null)
+    info "decode containers: ${sc}"
+    # The sidecar is a native sidecar, so it starts BEFORE vLLM and proxies to
+    # localhost:8200 while nothing is listening — a burst of "connection
+    # refused" during model load is expected and means nothing. Only errors
+    # logged after the pod went Ready indicate a real KV-transfer problem, so
+    # date them against the Ready transition instead of counting blindly.
+    local ready_at
+    ready_at=$(kubectl get pod "$decode_pod" -n "$NAMESPACE" \
+        -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.lastTransitionTime}{end}' 2>/dev/null)
+    kubectl logs -n "$NAMESPACE" "$decode_pod" -c routing-proxy --tail=400 2>/dev/null \
+      | READY_AT="$ready_at" python3 -c '
+import sys, os, json, datetime as dt
+raw = os.environ.get("READY_AT", "")
+try:
+    ready = dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+except Exception:
+    ready = 0
+errs = []
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if d.get("level") == "error":
+        errs.append((d.get("ts", 0), d.get("msg", "")[:120]))
+after = [e for e in errs if e[0] > ready + 2]
+pre = len(errs) - len(after)
+if not after:
+    print("   PASS  routing-proxy: no errors since the pod went Ready"
+          + (" (%d during startup, expected)" % pre if pre else ""))
+else:
+    print("   WARN  routing-proxy logged %d error(s) AFTER becoming Ready:" % len(after))
+    for _, m in after[:5]:
+        print("           " + m)
+' >&2
+  fi
+}
+
+# =========================================================================
+# teardown
+# =========================================================================
+teardown() {
+  stage "TEARDOWN ${NAMESPACE}"
+  run helm uninstall "$GUIDE_NAME" -n "$NAMESPACE" --wait --timeout 3m || true
+  run kubectl delete namespace "$NAMESPACE" --wait=true --timeout=10m || true
+  ok "namespace ${NAMESPACE} removed"
+  exit 0
+}
+
+summary() {
+  stage "SUMMARY"
+  cat >&2 <<EOF
+   guide:      upstream ${GUIDE_NAME} @ $(git -C "$LLMD_DIR" log -1 --format='%h' 2>/dev/null || echo '?')
+   namespace:  ${NAMESPACE}
+   model:      ${MODEL}
+   topology:   prefill ${PREFILL_REPLICAS} x TP=${PREFILL_TP} + decode ${DECODE_REPLICAS} x TP=${DECODE_TP} = ${TOTAL_GPUS} GPU
+   router:     standalone (EPP + envoy sidecar), release "${GUIDE_NAME}"
+   artifacts:  ${WORKDIR}/
+                 modelserver.rendered.yaml   exactly what was applied
+                 router.rendered.yaml        the helm output
+                 pd-config.yaml              the EPP plugin config in force
+                 verify.response.txt         the completion response
+
+   endpoint:   export IP=\$(kubectl get service ${GUIDE_NAME}-epp -n ${NAMESPACE} -o jsonpath='{.spec.clusterIP}')
+   re-verify:  ./$(basename "$0") --verify-only
+   teardown:   ./$(basename "$0") --teardown
+EOF
+}
+
+# =========================================================================
+main() {
+  printf '%s\n' "logging to ${LOG}" >&2
+  # --render-only exercises the checkout + overlay + assertions with no cluster
+  # at all, which is how you validate a change to this script safely.
+  if [[ $RENDER_ONLY == true ]]; then
+    checkout_repo; render_overlay; summary; exit 0
+  fi
+  preflight
+  checkout_repo
+  [[ $TEARDOWN == true ]] && teardown
+  if [[ $VERIFY_ONLY == true ]]; then
+    verify; summary; exit 0
+  fi
+  clean_namespace
+  create_hf_secret
+  install_router
+  render_overlay
+  apply_modelserver
+  wait_ready
+  verify
+  summary
+}
+
+main 2>&1 | tee "$LOG"
+exit "${PIPESTATUS[0]}"
