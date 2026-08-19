@@ -105,7 +105,7 @@ while [[ $# -gt 0 ]]; do
     --chunk-size)  CHUNK_SIZE="${2:?}"; FORCED_CHUNK=true; shift 2 ;;
     --namespace|-n) NAMESPACE="${2:?}"; shift 2 ;;
     --guide)       GUIDE_NAME="${2:?}"; shift 2 ;;
-    -h|--help)     sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//' | head -n -1; exit 0 ;;
+    -h|--help)     sed -n '2,/^set -uo/{/^set -uo/!p;}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             die "unknown argument: $1  (try --help)" ;;
   esac
 done
