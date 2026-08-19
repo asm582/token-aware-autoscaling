@@ -64,12 +64,21 @@
 #   ./deploy-pd-guide.sh --teardown      # helm uninstall + delete namespace
 #   ./deploy-pd-guide.sh --namespace NS  # default pd-test
 #   ./deploy-pd-guide.sh --ref COMMIT    # llm-d checkout ref, default main
+#   ./deploy-pd-guide.sh --model-cache   # share one downloaded copy of the weights via
+#                                        # a PVC instead of every pod downloading its own
+#                                        # (see MODEL_CACHE_* below). Scoped to $NAMESPACE:
+#                                        # a full clean run (the default) still deletes it
+#                                        # along with the namespace; use --skip-clean to
+#                                        # reuse a populated cache across reruns.
 #
 # Environment overrides (all optional):
 #   MODEL PREFILL_REPLICAS PREFILL_TP DECODE_REPLICAS DECODE_TP
 #   PREFILL_CPU PREFILL_MEM DECODE_CPU DECODE_MEM
 #   PREFILL_GPU_MEM_UTIL  (default 0.85; headroom for cold-start CUDA graph capture)
 #   HF_TOKEN  ROLLOUT_TIMEOUT
+#   MODEL_CACHE (default false)  MODEL_CACHE_PVC_NAME  MODEL_CACHE_PVC_SIZE (default 100Gi)
+#   MODEL_CACHE_STORAGE_CLASS  MODEL_CACHE_MOUNT (default /model-cache)
+#   MODEL_DOWNLOAD_IMAGE (default python:3.12-slim)  MODEL_CACHE_DOWNLOAD_TIMEOUT (default 2400)
 #
 set -uo pipefail
 
@@ -112,6 +121,18 @@ DECODE_MEM="${DECODE_MEM:-}"
 # KEDA-triggered scale-out has room to start. Set to empty to keep the guide's default.
 PREFILL_GPU_MEM_UTIL="${PREFILL_GPU_MEM_UTIL:-0.85}"
 
+# Opt-in shared model-weight cache (mirrors llm-d-benchmark's PVC + one-time download
+# Job pattern) so pods stop re-downloading the same weights via the guide's emptyDir.
+# Off by default: the guide's own behavior is left exactly as-is unless requested.
+MODEL_CACHE="${MODEL_CACHE:-false}"
+MODEL_CACHE_PVC_NAME="${MODEL_CACHE_PVC_NAME:-model-cache}"
+MODEL_CACHE_PVC_SIZE="${MODEL_CACHE_PVC_SIZE:-100Gi}"          # ~65GB weights + headroom
+MODEL_CACHE_STORAGE_CLASS="${MODEL_CACHE_STORAGE_CLASS:-}"     # "" = cluster default
+MODEL_CACHE_MOUNT="${MODEL_CACHE_MOUNT:-/model-cache}"
+MODEL_DOWNLOAD_IMAGE="${MODEL_DOWNLOAD_IMAGE:-python:3.12-slim}"
+MODEL_CACHE_DOWNLOAD_TIMEOUT="${MODEL_CACHE_DOWNLOAD_TIMEOUT:-2400}"
+MODEL_PATH="models/${MODEL}"                                  # local cache layout
+
 WORKDIR="${WORKDIR:-${PWD}/.pd-guide-workspace}"
 OVERLAY_DIR="${WORKDIR}/overlay"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-2400}"   # first start pulls a ~15GB image and downloads model weights
@@ -147,7 +168,8 @@ while [[ $# -gt 0 ]]; do
     --teardown)     TEARDOWN=true; shift ;;
     --namespace|-n) NAMESPACE="${2:?--namespace needs a value}"; shift 2 ;;
     --ref)          LLMD_REF="${2:?--ref needs a value}"; shift 2 ;;
-    --model)        MODEL="${2:?--model needs a value}"; shift 2 ;;
+    --model)        MODEL="${2:?--model needs a value}"; MODEL_PATH="models/${MODEL}"; shift 2 ;;
+    --model-cache)  MODEL_CACHE=true; shift ;;
     -h|--help)      usage ;;
     *)              die "unknown argument: $1  (try --help)" ;;
   esac
@@ -297,8 +319,13 @@ PY
 
   # The guide mounts emptyDir at /.cache, so every pod downloads its own copy of
   # the weights to node ephemeral storage. Qwen3-32B is ~65GB per pod.
-  warn "the guide uses no model PVC: each of the $((PREFILL_REPLICAS + DECODE_REPLICAS)) pods downloads its own"
-  warn "  copy of ${MODEL} (~65GB) to node ephemeral storage via the emptyDir at /.cache"
+  if [[ $MODEL_CACHE == true ]]; then
+    ok "model cache enabled: pods will share one downloaded copy via PVC ${MODEL_CACHE_PVC_NAME}"
+  else
+    warn "the guide uses no model PVC: each of the $((PREFILL_REPLICAS + DECODE_REPLICAS)) pods downloads its own"
+    warn "  copy of ${MODEL} (~65GB) to node ephemeral storage via the emptyDir at /.cache"
+    warn "  use --model-cache to share one download across pods instead"
+  fi
 }
 
 # =========================================================================
@@ -405,10 +432,126 @@ create_hf_secret() {
 }
 
 # =========================================================================
-# STAGE 4 — router (guide step 1, standalone mode, values verbatim)
+# STAGE 4 — shared model-weight cache (opt-in, --model-cache)
+# =========================================================================
+provision_model_cache() {
+  stage "STAGE 4  model cache PVC (optional)"
+
+  if [[ $MODEL_CACHE != true ]]; then
+    info "--model-cache not set; pods will download their own copies via the guide's emptyDir"
+    return 0
+  fi
+
+  cat > "${WORKDIR}/model-cache-pvc.yaml" <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${MODEL_CACHE_PVC_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: ${MODEL_CACHE_PVC_SIZE}
+EOF
+  [[ -n $MODEL_CACHE_STORAGE_CLASS ]] \
+    && printf '  storageClassName: %s\n' "$MODEL_CACHE_STORAGE_CLASS" >> "${WORKDIR}/model-cache-pvc.yaml"
+
+  run kubectl apply -n "$NAMESPACE" -f "${WORKDIR}/model-cache-pvc.yaml" \
+    || die "cannot create model cache PVC ${MODEL_CACHE_PVC_NAME}"
+  ok "PVC ${MODEL_CACHE_PVC_NAME} requested (${MODEL_CACHE_PVC_SIZE}, RWX)"
+
+  # Idempotent across --skip-clean reruns: a full clean run deletes the namespace
+  # (and this PVC/Job with it), so this only ever matters when the namespace survived.
+  if [[ $DRY_RUN == false ]] && kubectl get job model-cache-download -n "$NAMESPACE" >/dev/null 2>&1; then
+    local succeeded
+    succeeded=$(kubectl get job model-cache-download -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null)
+    if [[ $succeeded == "1" ]]; then
+      ok "model-cache-download already completed; reusing the PVC without re-downloading"
+      return 0
+    fi
+    info "a previous download job exists but did not complete; deleting it and retrying"
+    kubectl delete job model-cache-download -n "$NAMESPACE" --wait=true --timeout=60s >/dev/null 2>&1 || true
+  fi
+
+  cat > "${WORKDIR}/model-cache-download-job.yaml" <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-cache-download
+  namespace: ${NAMESPACE}
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: downloader
+          image: ${MODEL_DOWNLOAD_IMAGE}
+          # A :latest tag plus the default imagePullPolicy: Always would re-pull the
+          # image every run; llm-d-benchmark hit exactly this and had a download job
+          # time out mid-image-pull before transferring a single byte of weights.
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p "\${MOUNT_PATH}/\${MODEL_PATH}"
+              pip install -q -U --user huggingface_hub
+              export PATH="\${PATH}:\${HOME}/.local/bin"
+              if [ -n "\${HF_TOKEN:-}" ]; then
+                hf auth login --token "\${HF_TOKEN}"
+              fi
+              hf download "\${HF_MODEL_ID}" --local-dir "\${MOUNT_PATH}/\${MODEL_PATH}"
+          env:
+            - name: MODEL_PATH
+              value: ${MODEL_PATH}
+            - name: HF_MODEL_ID
+              value: ${MODEL}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+                  optional: true
+            - name: HF_HOME
+              value: /tmp/huggingface
+            - name: HOME
+              value: /tmp
+            - name: MOUNT_PATH
+              value: ${MODEL_CACHE_MOUNT}
+          volumeMounts:
+            - name: model-cache
+              mountPath: ${MODEL_CACHE_MOUNT}
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: ${MODEL_CACHE_PVC_NAME}
+EOF
+
+  run kubectl apply -n "$NAMESPACE" -f "${WORKDIR}/model-cache-download-job.yaml" \
+    || die "cannot create model-cache-download job"
+
+  if [[ $DRY_RUN == true ]]; then
+    warn "--dry-run: not waiting for the download job"
+    return 0
+  fi
+
+  info "waiting up to ${MODEL_CACHE_DOWNLOAD_TIMEOUT}s for ${MODEL} to download to the PVC"
+  if ! kubectl wait --for=condition=complete job/model-cache-download -n "$NAMESPACE" \
+        --timeout="${MODEL_CACHE_DOWNLOAD_TIMEOUT}s" >/dev/null 2>&1; then
+    kubectl logs -n "$NAMESPACE" job/model-cache-download --tail=80 >&2 2>/dev/null
+    die "model-cache-download job did not complete within ${MODEL_CACHE_DOWNLOAD_TIMEOUT}s"
+  fi
+  ok "weights for ${MODEL} downloaded to PVC ${MODEL_CACHE_PVC_NAME} at ${MODEL_CACHE_MOUNT}/${MODEL_PATH}"
+}
+
+# =========================================================================
+# STAGE 5 — router (guide step 1, standalone mode, values verbatim)
 # =========================================================================
 install_router() {
-  stage "STAGE 4  llm-d Router (standalone)"
+  stage "STAGE 5  llm-d Router (standalone)"
 
   local base_values="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
   local guide_values="${GUIDE_DIR}/router/${GUIDE_NAME}.values.yaml"
@@ -469,7 +612,7 @@ PY
 # =========================================================================
 BASE_OVERLAY=
 render_overlay() {
-  stage "STAGE 5  model server overlay"
+  stage "STAGE 6  model server overlay"
 
   BASE_OVERLAY="${GUIDE_DIR}/modelserver/gpu/vllm/base"
   [[ -d $BASE_OVERLAY ]] || die "missing ${BASE_OVERLAY}"
@@ -566,6 +709,8 @@ EOF
 # emit one JSON6902 patch block for a role
 _role_patch() {
   local role="$1" name="$2" replicas="$3" tp="$4" tpidx="$5" cpu="$6" mem="$7" gpu_mem_util="${8:-}"
+  local model_arg="${MODEL}"
+  [[ $MODEL_CACHE == true ]] && model_arg="${MODEL_CACHE_MOUNT}/${MODEL_PATH}"
   cat <<EOF
   - target:
       kind: Deployment
@@ -576,7 +721,7 @@ _role_patch() {
         value: ${replicas}
       - op: replace
         path: /spec/template/spec/containers/0/args/0
-        value: ${MODEL}
+        value: ${model_arg}
       - op: replace
         path: /spec/template/spec/containers/0/args/${tpidx}
         value: --tensor-parallel-size=${tp}
@@ -608,6 +753,25 @@ EOF
         path: /spec/template/spec/containers/0/args/-
         value: --gpu-memory-utilization=${gpu_mem_util}
 EOF
+  if [[ $MODEL_CACHE == true ]]; then
+    cat <<EOF
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --served-model-name=${MODEL}
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: model-cache
+          mountPath: ${MODEL_CACHE_MOUNT}
+          readOnly: true
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: model-cache
+          persistentVolumeClaim:
+            claimName: ${MODEL_CACHE_PVC_NAME}
+EOF
+  fi
   return 0
 }
 
@@ -616,12 +780,16 @@ EOF
 # render is the failure mode that costs the most time downstream.
 assert_render() {
   python3 - "${WORKDIR}/modelserver.rendered.yaml" \
-      "$MODEL" "$PREFILL_REPLICAS" "$PREFILL_TP" "$DECODE_REPLICAS" "$DECODE_TP" <<'PY' >&2 \
+      "$MODEL" "$PREFILL_REPLICAS" "$PREFILL_TP" "$DECODE_REPLICAS" "$DECODE_TP" \
+      "$MODEL_CACHE" "$MODEL_CACHE_MOUNT" "$MODEL_PATH" "$MODEL_CACHE_PVC_NAME" <<'PY' >&2 \
     || die "the rendered manifest does not match the requested topology — nothing applied"
 import sys, yaml
 path, model = sys.argv[1], sys.argv[2]
 pr, ptp, dr, dtp = (int(x) for x in sys.argv[3:7])
+model_cache = sys.argv[7] == "true"
+cache_mount, model_path, cache_pvc = sys.argv[8], sys.argv[9], sys.argv[10]
 want = {"prefill": (pr, ptp), "decode": (dr, dtp)}
+want_model_arg = f"{cache_mount}/{model_path}" if model_cache else model
 docs = [d for d in yaml.safe_load_all(open(path)) if d]
 raw = open(path).read()
 bad, seen = [], {}
@@ -660,13 +828,29 @@ for d in docs:
                 for x in pod.get("initContainers", [])]
 
     if got_rep != wrep:            bad.append(f"{role}: replicas={got_rep}, want {wrep}")
-    if got_model != model:         bad.append(f"{role}: model={got_model}, want {model}")
+    if got_model != want_model_arg: bad.append(f"{role}: model={got_model}, want {want_model_arg}")
     if got_tp != str(wtp):         bad.append(f"{role}: tensor-parallel-size={got_tp}, want {wtp}")
     if str(got_gpu_l) != str(wtp): bad.append(f"{role}: gpu limit={got_gpu_l}, want {wtp}")
     if str(got_gpu_r) != str(wtp): bad.append(f"{role}: gpu request={got_gpu_r}, want {wtp}")
     if not img or "REPLACE" in img: bad.append(f"{role}: unusable image {img!r}")
     if not kv or "NixlConnector" not in kv:
         bad.append(f"{role}: kv-transfer-config missing NixlConnector: {kv!r}")
+
+    if model_cache:
+        served = next((a.split("=", 1)[1] for a in args if str(a).startswith("--served-model-name")), None)
+        if served != model:
+            bad.append(f"{role}: --served-model-name={served}, want {model}")
+        mounts = c.get("volumeMounts", [])
+        cm = next((m for m in mounts if m.get("name") == "model-cache"), None)
+        if not cm:
+            bad.append(f"{role}: no model-cache volumeMount on the modelserver container")
+        elif cm.get("mountPath") != cache_mount or not cm.get("readOnly"):
+            bad.append(f"{role}: model-cache volumeMount={cm}, want mountPath={cache_mount} readOnly=true")
+        vols = pod.get("volumes", [])
+        pv = next((v for v in vols if v.get("name") == "model-cache"), None)
+        got_claim = (pv or {}).get("persistentVolumeClaim", {}).get("claimName")
+        if got_claim != cache_pvc:
+            bad.append(f"{role}: model-cache PVC claim={got_claim}, want {cache_pvc}")
 
     print(f"   {role:<8} replicas={got_rep} tp={got_tp} gpu={got_gpu_l} "
           f"kv=NixlConnector sidecars={sidecars or '-'}")
@@ -709,7 +893,7 @@ PY
 }
 
 apply_modelserver() {
-  stage "STAGE 6  apply model server"
+  stage "STAGE 7  apply model server"
   # Equivalent to the guide's `kubectl apply -k <overlay>`, except the exact
   # bytes that were just asserted are what get applied.
   run kubectl apply -n "$NAMESPACE" -f "${WORKDIR}/modelserver.rendered.yaml" \
@@ -721,7 +905,7 @@ apply_modelserver() {
 # STAGE 7 — wait for readiness
 # =========================================================================
 wait_ready() {
-  stage "STAGE 7  wait for pods (timeout ${ROLLOUT_TIMEOUT}s)"
+  stage "STAGE 8  wait for pods (timeout ${ROLLOUT_TIMEOUT}s)"
   [[ $DRY_RUN == true ]] && { warn "--dry-run: not waiting"; return 0; }
 
   local deploys waited=0 interval=15
@@ -798,7 +982,7 @@ dump_diagnostics() {
 # STAGE 8 — verification (the guide's own, plus a P/D assertion)
 # =========================================================================
 verify() {
-  stage "STAGE 8  verification"
+  stage "STAGE 9  verification"
   [[ $DRY_RUN == true ]] && { warn "--dry-run: not verifying"; return 0; }
 
   # 8a — the guide's step 1: resolve the standalone endpoint.
@@ -964,12 +1148,19 @@ teardown() {
 
 summary() {
   stage "SUMMARY"
+  local cache_line
+  if [[ $MODEL_CACHE == true ]]; then
+    cache_line="PVC ${MODEL_CACHE_PVC_NAME} (${MODEL_CACHE_PVC_SIZE}) at ${MODEL_CACHE_MOUNT} — persists only across --skip-clean reruns"
+  else
+    cache_line="disabled (per-pod emptyDir download; use --model-cache to share one)"
+  fi
   cat >&2 <<EOF
    guide:      upstream ${GUIDE_NAME} @ $(git -C "$LLMD_DIR" log -1 --format='%h' 2>/dev/null || echo '?')
    namespace:  ${NAMESPACE}
    model:      ${MODEL}
    topology:   prefill ${PREFILL_REPLICAS} x TP=${PREFILL_TP} + decode ${DECODE_REPLICAS} x TP=${DECODE_TP} = ${TOTAL_GPUS} GPU
    router:     standalone (EPP + envoy sidecar), release "${GUIDE_NAME}"
+   model cache: ${cache_line}
    artifacts:  ${WORKDIR}/
                  modelserver.rendered.yaml   exactly what was applied
                  router.rendered.yaml        the helm output
@@ -998,6 +1189,7 @@ main() {
   fi
   clean_namespace
   create_hf_secret
+  provision_model_cache
   install_router
   render_overlay
   apply_modelserver

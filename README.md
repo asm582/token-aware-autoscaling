@@ -192,6 +192,12 @@ This is why the auth chain exists and why the verifier tests it with the SA's ow
 
 **The guide provisions no model PVC**, so every pod downloads its own copy of the weights
 (~65 GB for Qwen3-32B) to node ephemeral storage through the `emptyDir` at `/.cache`.
+`deploy-pd-guide.sh --model-cache` fixes this the way `llm-d-benchmark` does: a shared
+ReadWriteMany PVC, populated once by a Job, mounted read-only into every prefill/decode
+pod (`vllm serve` is pointed at the local path and paired with `--served-model-name` so
+client requests are unaffected). It is opt-in and scoped to `$NAMESPACE` — a full clean
+run (the default) still deletes the namespace and the PVC with it; pass `--skip-clean`
+to reuse a populated cache across reruns.
 
 ## Upstream gaps found while testing this (unreported as of 2026-08-18, llm-d @ main)
 
