@@ -13,3 +13,6 @@ timeline-*.csv
 
 # run-benchmark.sh output (GBs per run) and its `latest` symlink
 benchmark-results/
+
+# experiment run outputs (reports, timelines, metrics per run)
+experiments/
