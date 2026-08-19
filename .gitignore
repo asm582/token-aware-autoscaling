@@ -5,6 +5,9 @@
 # deploy-pd-guide.sh + calibrate-peak-prefill.sh artifacts
 .pd-guide-workspace/
 
+# deploy-pd-guide.sh's default llm-d checkout (LLMD_DIR), cloned fresh on demand
+/llm-d/
+
 # launch-scaledobjects.sh render (regenerated every run)
 rendered.yaml
 
