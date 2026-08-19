@@ -190,10 +190,10 @@ GPUs across both roles. Use `--max` to match your fleet.
 suppresses that error and serves `fallback` replicas**, so a broken trigger looks healthy.
 This is why the auth chain exists and why the verifier tests it with the SA's own token.
 
-**The guide provisions no model PVC**, so every pod downloads its own copy of the weights
-(~65 GB for Qwen3-32B) to node ephemeral storage through the `emptyDir` at `/.cache`.
-`deploy-pd-guide.sh --model-cache` fixes this the way `llm-d-benchmark` does: a shared
-ReadWriteMany PVC, populated once by a Job, mounted read-only into every prefill/decode
+**The upstream guide provisions no model PVC**, so by default every pod downloads its own
+copy of the weights (~65 GB for Qwen3-32B) to node ephemeral storage through the `emptyDir`
+at `/.cache`. `deploy-pd-guide.sh --model-cache` fixes this the way `llm-d-benchmark` does: a
+shared ReadWriteMany PVC, populated once by a Job, mounted read-only into every prefill/decode
 pod (`vllm serve` is pointed at the local path and paired with `--served-model-name` so
 client requests are unaffected). It is opt-in and scoped to `$NAMESPACE` — a full clean
 run (the default) still deletes the namespace and the PVC with it; pass `--skip-clean`
