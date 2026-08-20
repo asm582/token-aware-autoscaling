@@ -130,6 +130,20 @@ pattern. Pass it with `--workload-file`.
 [`experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md):
 both triggers fired (prefill peaked 10.76 vs threshold 1.5, decode 0.994 vs 0.8), the fleet
 went 4 → 12 GPUs and back — and it documents three defects found in the process.
+[`experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md)
+repeats it with `--model-cache` and `V_P = 2696` (fleet 4 → 14 GPUs) and ties the run to its
+analysis charts, below.
+
+**Reading the analysis charts through `peakPrefillThroughput` (V_P).** The
+`throughput_vs_qps` / `latency_vs_qps` charts a benchmark emits are the same thing V_P predicts
+up front. Saturation for one prefill replica is at `QPS_sat = V_P / ISL` (here 2696 / 2048 ≈
+**1.32 req/s**): every stage at or below that rate held TTFT near ~1 s, and the first stage above
+it (rate 1.5) is exactly where the latency chart's TTFT knee appears and the throughput chart
+flattens toward the per-replica ceiling (~2696 input tok/s). The blowup is all *time-to-first-token*
+(ITL barely moved, 15 → 32 ms), i.e. prefill queue — which is precisely what the trigger's
+`inflight_tokens / V_P` measures. So the practical read is: keep offered load per replica below
+`V_P / ISL`, and pre-provision headroom so a rate step does not outrun scale-up + weight-load lag
+(the one large stage-average TTFT in that run is transition cost, not steady state).
 
 ## Monitoring is required, and is not part of the deploy
 
