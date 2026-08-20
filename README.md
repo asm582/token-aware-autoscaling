@@ -126,6 +126,12 @@ returns partial results that look complete.
 and scale-down. Traffic changes *within* a run via `load.stages` — the standard upstream
 pattern. Pass it with `--workload-file`.
 
+`workloads/pd-autoscaling-ramp-prefill-heavy.yaml` is the prefill-dominated sibling: same
+7-stage shape but **ISL 8192 / OSL 256 (32:1)** and rates rescaled to the larger per-request
+prefill cost (0.15 → 1.4 → 0.15). It exercises the *prefill* trigger specifically — per-replica
+saturation is only `V_P / ISL ≈ 0.33 req/s`, so prefill drives to the cap early while decode
+compute stays idle.
+
 `experiments/` holds the report and the small artifacts from runs worth keeping. Start with
 [`experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md):
 both triggers fired (prefill peaked 10.76 vs threshold 1.5, decode 0.994 vs 0.8), the fleet
@@ -133,6 +139,10 @@ went 4 → 12 GPUs and back — and it documents three defects found in the proc
 [`experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md)
 repeats it with `--model-cache` and `V_P = 2696` (fleet 4 → 14 GPUs) and ties the run to its
 analysis charts, below.
+[`experiments/2026-08-20-prefill-heavy/EXPERIMENT-REPORT.md`](experiments/2026-08-20-prefill-heavy/EXPERIMENT-REPORT.md)
+runs the prefill-heavy workload (ISL 8192 / OSL 256): prefill pegged at the cap, the TTFT knee
+lands exactly at `V_P / ISL ≈ 0.33 req/s`, and the same rate served warm vs cold shows a **5.8×**
+TTFT gap — the clearest single-picture case for the autoscaler.
 
 **Reading the analysis charts through `peakPrefillThroughput` (V_P).** The
 `throughput_vs_qps` / `latency_vs_qps` charts a benchmark emits are the same thing V_P predicts
