@@ -216,14 +216,31 @@ PYEOF
     die "only ${ready}/${total} model server pods Ready — wait for the rollout"; }
   ok "${ready}/${total} model server pods Ready"
 
-  # Model name from the live Deployment: `vllm serve <model>` is args[0].
+  # Model name from the live Deployment. Prefer --served-model-name: that is the id
+  # the endpoint answers /v1/models with and the harness must request. `vllm serve
+  # <model>` is args[0], but under --model-cache args[0] is the local weight path
+  # (/model-cache/...) while --served-model-name carries the real id — using args[0]
+  # then makes the harness request a model the server does not expose. Fall back to
+  # args[0] only when --served-model-name is absent.
   if [[ -z $MODEL ]]; then
     MODEL=$(kubectl get deploy -n "$NAMESPACE" -o json | python3 -c '
 import json, sys
 for d in json.load(sys.stdin)["items"]:
     for c in d["spec"]["template"]["spec"]["containers"]:
-        if c["name"] == "modelserver":
-            print(c["args"][0]); raise SystemExit')
+        if c["name"] != "modelserver":
+            continue
+        args = c.get("args") or []
+        toks = (c.get("command") or []) + args
+        served = None
+        for i, t in enumerate(toks):
+            if t == "--served-model-name" and i + 1 < len(toks):
+                served = toks[i + 1]; break
+            if t.startswith("--served-model-name="):
+                served = t.split("=", 1)[1]; break
+        if served:
+            print(served); raise SystemExit
+        if args:
+            print(args[0]); raise SystemExit')
     [[ -n $MODEL ]] || die "cannot read the served model from any Deployment; pass --model"
     ok "model (discovered): ${MODEL}"
   else
