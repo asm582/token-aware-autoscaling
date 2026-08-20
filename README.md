@@ -132,6 +132,13 @@ prefill cost (0.15 → 1.4 → 0.15). It exercises the *prefill* trigger specifi
 saturation is only `V_P / ISL ≈ 0.33 req/s`, so prefill drives to the cap early while decode
 compute stays idle.
 
+`workloads/pd-autoscaling-ramp-decode-heavy.yaml` is the mirror image: **ISL 256 / OSL 8192
+(1:32)** and rates 0.10 → 0.80 → 0.10. Each request does trivial prefill and a long generation,
+so it exercises the *decode* trigger (KV-cache occupancy) while prefill stays idle. Sizing is
+anchored to the measured decode KV cache (330,752 tokens/replica), so the ramp walks concurrency
+up past the single-replica KV ceiling and back. Because generations are long, set a
+`request_timeout` above `OSL × steady-ITL` — see the bite below.
+
 `experiments/` holds the report and the small artifacts from runs worth keeping. Start with
 [`experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md):
 both triggers fired (prefill peaked 10.76 vs threshold 1.5, decode 0.994 vs 0.8), the fleet
@@ -143,6 +150,11 @@ analysis charts, below.
 runs the prefill-heavy workload (ISL 8192 / OSL 256): prefill pegged at the cap, the TTFT knee
 lands exactly at `V_P / ISL ≈ 0.33 req/s`, and the same rate served warm vs cold shows a **5.8×**
 TTFT gap — the clearest single-picture case for the autoscaler.
+[`experiments/2026-08-20-decode-heavy/EXPERIMENT-REPORT.md`](experiments/2026-08-20-decode-heavy/EXPERIMENT-REPORT.md)
+runs the decode-heavy workload (ISL 256 / OSL 8192): decode scaled 1 → 4 on KV occupancy (metric
+2.98 vs 0.8) while prefill stayed at 1, and it shows the decode-specific asymmetry — saturation
+surfaces as *failed* (timed-out) requests rather than the queued latency prefill produces, and the
+fleet peaks a full generation-time *behind* the traffic.
 
 **Reading the analysis charts through `peakPrefillThroughput` (V_P).** The
 `throughput_vs_qps` / `latency_vs_qps` charts a benchmark emits are the same thing V_P predicts
@@ -209,6 +221,15 @@ experiment report.
 
 **`maxReplicaCount: 10`** (the summary's value) is 10 × TP GPUs per role. At TP=2 that is 40
 GPUs across both roles. Use `--max` to match your fleet.
+
+**Long-OSL workloads hit the harness's 300 s request timeout and get counted as failures.**
+inference-perf defaults to `request_timeout: null` (a 300 s library default). A single OSL-8192
+generation already needs `OSL × steady-ITL ≈ 8192 × 28 ms ≈ 229 s`, so once decode is contended the
+total slips past 300 s and the client aborts a request that was still generating — 18% of the
+decode-heavy run "failed" this way while the server was fine. Set `request_timeout` above
+`OSL × steady-ITL` (e.g. 600 s) for long generations, or decode saturation is measured as failure
+instead of latency. (This is the decode analogue of prefill's queue: decode backpressure is
+memory/stream, so it surfaces as timeouts, not a backlog that eventually drains.)
 
 **On OpenShift, Thanos `:9091` answers unauthenticated queries with 401 — and KEDA
 suppresses that error and serves `fallback` replicas**, so a broken trigger looks healthy.
