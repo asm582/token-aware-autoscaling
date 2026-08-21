@@ -50,8 +50,6 @@
 #   ./calibrate-peak-prefill.sh --apply          # + patch the EPP and verify it took
 #   ./calibrate-peak-prefill.sh --dry-run        # preflight + asserts only
 #   ./calibrate-peak-prefill.sh --allow-load     # measure anyway on a busy stack
-#   ./calibrate-peak-prefill.sh --decompose      # + measure the prefill pod directly, to split
-#                                               #   prefill compute from the P/D KV-transfer cost
 #   ./calibrate-peak-prefill.sh --chunk-size N   # override, with a loud warning
 #
 # Environment overrides:
@@ -85,7 +83,7 @@ T_MAX_SECONDS="${T_MAX_SECONDS:-18}"
 MATRIX_REFERENCE="${MATRIX_REFERENCE:-15928}"
 
 WORKDIR="${WORKDIR:-${PWD}/.pd-guide-workspace/calibration}"
-DRY_RUN=false; APPLY=false; ALLOW_LOAD=false; FORCED_CHUNK=false; DECOMPOSE=false
+DRY_RUN=false; APPLY=false; ALLOW_LOAD=false; FORCED_CHUNK=false
 
 if [[ -t 2 ]]; then B=$'\033[1m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; Z=$'\033[0m'
 else B=; R=; G=; Y=; C=; Z=; fi
@@ -100,7 +98,6 @@ while [[ $# -gt 0 ]]; do
     --dry-run)     DRY_RUN=true; shift ;;
     --apply)       APPLY=true; shift ;;
     --allow-load)  ALLOW_LOAD=true; shift ;;
-    --decompose)   DECOMPOSE=true; shift ;;
     --repeats)     REPEATS="${2:?}"; shift 2 ;;
     --chunk-size)  CHUNK_SIZE="${2:?}"; FORCED_CHUNK=true; shift 2 ;;
     --namespace|-n) NAMESPACE="${2:?}"; shift 2 ;;
@@ -248,27 +245,6 @@ print(m["id"], m.get("max_model_len", 0))' 2>/dev/null)
     warn "  whichever pods the EPP picked, not one pod's ceiling. Scale prefill to 1 for a clean read."
   fi
 
-  # --- KV bytes per token, from the model's own config. Needed to turn the
-  # prefill-vs-P/D TTFT gap into an implied KV-transfer bandwidth, which is the
-  # only way to tell "prefill is slow" from "the KV hop is slow".
-  KV_BYTES_PER_TOKEN=$(kubectl exec -n "$NAMESPACE" "${PREFILL_PODS[0]}" -c modelserver -- python3 -c '
-import glob, json, sys
-f = sorted(glob.glob("/.cache/huggingface/hub/models--*/snapshots/*/config.json"))
-if not f:
-    sys.exit(0)
-c = json.load(open(f[0]))
-try:
-    L = c["num_hidden_layers"]
-    kvh = c.get("num_key_value_heads") or c["num_attention_heads"]
-    hd = c.get("head_dim") or c["hidden_size"] // c["num_attention_heads"]
-except KeyError:
-    sys.exit(0)
-b = 1 if "fp8" in str(c.get("torch_dtype", "")).lower() else 2
-print(L * kvh * hd * 2 * b)' 2>/dev/null)
-  if [[ -n ${KV_BYTES_PER_TOKEN:-} ]]; then
-    info "  KV cache: $(( KV_BYTES_PER_TOKEN / 1024 )) KiB/token => $(python3 -c "print(f'{${KV_BYTES_PER_TOKEN} * ${CHUNK_SIZE} / 1024**3:.2f}')") GiB moved per ${CHUNK_SIZE}-token request"
-  fi
-
   # --- what the EPP is running right now
   LIVE_VALUE=$(read_live_epp_value)
   if [[ -n $LIVE_VALUE ]]; then
@@ -396,46 +372,6 @@ run_calibration() {
 }
 
 # =========================================================================
-# STAGE 3b — the same Job, aimed straight at one prefill pod
-# =========================================================================
-# Upstream's VLLM_ENDPOINT env var is documented, so this needs no new tooling:
-# point the identical Job at the prefill pod's own vLLM port and the request
-# never touches the router, the decode sidecar, or NIXL. The gap between the two
-# medians IS the P/D overhead for a CHUNK_SIZE prompt.
-DIRECT_RESULTS=()
-run_direct() {
-  [[ $DECOMPOSE == true ]] || return 0
-  stage "STAGE 3b  direct-to-prefill baseline (no router, no sidecar, no KV transfer)"
-  if [[ $DRY_RUN == true ]]; then warn "--dry-run: not running"; return 0; fi
-
-  local ip
-  ip=$(kubectl get pod "${PREFILL_PODS[0]}" -n "$NAMESPACE" -o jsonpath='{.status.podIP}' 2>/dev/null)
-  [[ -n $ip ]] || die "cannot read the prefill pod IP"
-  info "endpoint: http://${ip}:8000  (pod ${PREFILL_PODS[0]})"
-
-  local i
-  for (( i = 1; i <= REPEATS; i++ )); do
-    local out="${WORKDIR}/direct-${RUN_ID}-${i}.out"
-    local joblog="${WORKDIR}/direct-${RUN_ID}-${i}.joblog"
-    if ! env GUIDE_NAME="$GUIDE_NAME" NAMESPACE="$NAMESPACE" MODEL_NAME="$MODEL_NAME" \
-             CHUNK_SIZE="$CHUNK_SIZE" T_MAX_SECONDS="$T_MAX_SECONDS" \
-             NUM_WARMUP="$NUM_WARMUP" NUM_MEASUREMENTS="$NUM_MEASUREMENTS" \
-             VLLM_ENDPOINT="http://${ip}:8000" \
-             bash "${CAL_DIR}/calibrate.sh" > "$out" 2>&1; then
-      tail -25 "$out" >&2
-      die "direct-to-prefill run ${i} failed (full output: ${out})"
-    fi
-    kubectl logs -n "$NAMESPACE" job/calibrate-peak-throughput > "$joblog" 2>/dev/null || true
-    local val med
-    val=$(grep -oE 'peakPrefillThroughput = [0-9]+' "$out" | tail -1 | awk '{print $NF}')
-    med=$(grep -oE 'T\(B\) *= *[0-9.]+' "$joblog" | tail -1 | grep -oE '[0-9.]+')
-    [[ -n $val ]] || die "direct run ${i}: no value emitted"
-    DIRECT_RESULTS+=("$val")
-    ok "direct ${i}: ${val} tok/s   median TTFT=${med:-?}s"
-  done
-}
-
-# =========================================================================
 # STAGE 4 — analyse
 # =========================================================================
 FINAL_VALUE=
@@ -487,42 +423,6 @@ print(final)
 PY
 )
   [[ -n $FINAL_VALUE ]] || warn "analysis produced no final value"
-
-  # --- the split, when we have both legs
-  if [[ $DECOMPOSE == true && ${#DIRECT_RESULTS[@]} -gt 0 ]]; then
-    python3 - "$CHUNK_SIZE" "${KV_BYTES_PER_TOKEN:-0}" "$WORKDIR" "$RUN_ID" <<'PY' >&2
-import sys, glob, os, re, statistics as st
-chunk = int(sys.argv[1]); kvb = int(sys.argv[2] or 0)
-workdir, run_id = sys.argv[3], sys.argv[4]
-
-def samples(prefix):
-    out = []
-    for f in sorted(glob.glob(os.path.join(workdir, f"{prefix}-{run_id}-*.joblog"))):
-        for line in open(f, errors="replace"):
-            m = re.search(r"measure \d+: TTFT=([0-9.]+)s", line)
-            if m:
-                out.append(float(m.group(1)))
-    return out
-
-pd_s, dir_s = samples("repeat"), samples("direct")
-if not pd_s or not dir_s:
-    print("   WARN  missing one leg, cannot decompose"); raise SystemExit
-t_pd, t_dir = st.median(pd_s), st.median(dir_s)
-overhead = t_pd - t_dir
-print("")
-print("   -- TTFT decomposition (median of %d and %d samples) --" % (len(pd_s), len(dir_s)))
-print(f"   through the router, full P/D path : {t_pd:.3f}s  -> {int(chunk/t_pd)} tok/s")
-print(f"   direct to the prefill pod         : {t_dir:.3f}s  -> {int(chunk/t_dir)} tok/s")
-print(f"   difference (router + sidecar + KV): {overhead:.3f}s  ({overhead/t_pd*100:.0f}% of TTFT)")
-if kvb and overhead > 0:
-    gib = kvb * chunk / 1024**3
-    gbps = kvb * chunk * 8 / overhead / 1e9
-    print("")
-    print(f"   KV moved per request  : {gib:.2f} GiB  ({kvb//1024} KiB/token x {chunk} tokens)")
-    print(f"   implied KV bandwidth  : {gbps:.1f} Gbps, if the whole gap is transfer")
-    print(f"   prefill compute share : {t_dir/t_pd*100:.0f}% of TTFT")
-PY
-  fi
 }
 
 # =========================================================================
@@ -619,7 +519,6 @@ main() {
   stage "STAGE 2  idle gate (before)"
   assert_idle "before the run"
   run_calibration
-  run_direct
   if [[ $DRY_RUN == false ]]; then
     stage "STAGE 2b  idle gate (after)"
     assert_idle "after the run"
