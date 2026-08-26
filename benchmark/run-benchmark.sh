@@ -138,7 +138,7 @@ preflight() {
          It also provides the config/ and workload/ trees this script needs (see --base-dir)."
   ok "tools: llmdbenchmark $(llmdbenchmark --version 2>&1 | tr -d '\n'), kubectl, python3"
 
-  kubectl auth whoami >/dev/null 2>&1 || die "not authenticated — run your 'oc login'"
+  kubectl get ns default >/dev/null 2>&1 || die "not authenticated — run your 'oc login'"
   kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || die "namespace ${NAMESPACE} not found"
 
   # The spec templates resolve config/ relative to --base-dir. Derive it from the

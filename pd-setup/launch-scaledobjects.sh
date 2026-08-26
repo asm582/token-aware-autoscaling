@@ -2,14 +2,36 @@
 #
 # launch-scaledobjects.sh — create the KEDA auth chain + two TOKEN-AWARE ScaledObjects.
 #
-#   prefill:  seconds of uncached prefill backlog = sum(inflight_tokens) / V_P  > 1.5 s
+#   prefill:  seconds of uncached prefill backlog = sum(inflight_tokens) / V_P  > PREFILL_THRESHOLD s
 #   decode:   how full the decode KV caches are    = sum(kv_cache_usage_perc)   > 0.8
 #
 # Both triggers are the ones published in TOKEN-AWARE-AUTOSCALING-SUMMARY.md section 4.
 # The summary's own framing: prefill divides queued tokens by a measured token rate to get
-# SECONDS of backlog and compares that to a share of the TTFT budget (1.5s); decode reads a
+# SECONDS of backlog and compares that to a share of the TTFT budget; decode reads a
 # value that is already a fraction of capacity, so 0.8 is compared to it directly and means
 # "act at 80% full".
+#
+# THE PREFILL THRESHOLD IS WORKLOAD-DEPENDENT — 1.5s is the interactive/short-context default,
+# not a universal constant. It is the QUEUE-WAIT budget left after the irreducible idle floor:
+#
+#     threshold  ~=  TTFT_SLO  -  (ISL_uncached / V_P)
+#                    └ product ┘   └──── idle floor ────┘
+#
+# ISL/V_P ALREADY IS the end-to-end idle floor -- do NOT add a transfer term. calibrate-peak-
+# prefill.sh defines V_P = CHUNK_SIZE / median(TTFT) measured THROUGH THE ROUTER on an idle
+# stack; since TTFT is time-to-first-token, it already includes the NIXL KV transfer + first
+# decode step. Adding "+ transfer" double-counts what V_P absorbed. Autoscaling only removes
+# queueing, never the floor. If TTFT_SLO <= floor, no threshold meets it (raise V_P or shrink
+# uncached ISL). Per reference workload at V_P~=2696 (see summary section 2 table):
+#     prefill-heavy  ISL 8192 -> floor 3.0s  -> SLO 8s  => --prefill-threshold 5.0
+#     symmetrical    ISL 2048 -> floor 0.76s -> SLO 3s  => --prefill-threshold 2.2
+#     decode-heavy   ISL 256  -> TTFT trivially met     -> prefill moot; decode KV (0.8) governs
+# For a p90/p99 SLO, trim to ~60-70% of the formula (the metric is a per-replica AVERAGE). The
+# calibrated floor is a median under controlled load; if your SLO is against real client TTFT,
+# subtract your own measured low-load TTFT instead (this cluster saw ~4.2s mean vs 3.0s floor --
+# serving/measurement overhead, NOT transfer, which is already in V_P).
+# NOTE: this is NOT the router's maxTTFTPenaltyMs (default 18s) -- that is the total TTFT
+# degradation ceiling for breaking prefix-cache stickiness (routing), a different budget.
 #
 # This is MUTUALLY EXCLUSIVE with any other autoscaler on the same Deployments (e.g. the
 # shipped pool-saturation triggers): two ScaledObjects on one Deployment create two
@@ -52,6 +74,7 @@
 #   ./launch-scaledobjects.sh --dry-run            # render only
 #   ./launch-scaledobjects.sh --delete             # remove
 #   ./launch-scaledobjects.sh --vp 2665 --max 4   # 2665 measured on the reference stack
+#   ./launch-scaledobjects.sh --prefill-threshold 5.0   # long-context (ISL 8192, ~8s TTFT SLO)
 #   ./launch-scaledobjects.sh --decode-signal waiters   # the refused-admission variant
 #
 set -uo pipefail
@@ -67,7 +90,10 @@ MAX_REPLICAS="${MAX_REPLICAS:-10}"        # summary section 4: min 1 / max 10
 # calibrate-peak-prefill.sh --apply wrote there)  ->  refuse and tell the operator to
 # measure it.
 V_P="${V_P:-}"
-PREFILL_THRESHOLD="${PREFILL_THRESHOLD:-1.5}"   # seconds of backlog per replica
+PREFILL_THRESHOLD="${PREFILL_THRESHOLD:-1.5}"   # seconds of queue backlog per replica; WORKLOAD-DEPENDENT
+                                                # (= TTFT_SLO - ISL/V_P; the ISL/V_P floor already includes
+                                                # NIXL transfer + first token via calibrate). 1.5 = interactive/
+                                                # short-ISL default; raise for long context (see header table).
 DECODE_THRESHOLD="${DECODE_THRESHOLD:-0.8}"     # pods\x27 worth of full KV cache (summary section 3)
 POLLING_INTERVAL="${POLLING_INTERVAL:-15}"
 THANOS="${THANOS:-https://thanos-querier.openshift-monitoring.svc.cluster.local:9091}"

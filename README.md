@@ -52,6 +52,7 @@ anywhere: `LLMD_DIR=/path/to/llm-d ./deploy-pd-guide.sh`.
 # 3. measure peakPrefillThroughput on YOUR hardware, and apply it to the EPP
 ./calibrate-peak-prefill.sh --decompose     # measure + split prefill vs KV-transfer cost
 ./calibrate-peak-prefill.sh --apply         # measure, patch the EPP, verify it took
+#    (or from optimized-baseline: ./optimized-baseline/calibrate-peak-prefill.sh)
 
 # 4. arm the two ScaledObjects
 ./launch-scaledobjects.sh --vp <measured> --max 4
@@ -243,6 +244,36 @@ pod (`vllm serve` is pointed at the local path and paired with `--served-model-n
 client requests are unaffected). It is opt-in and scoped to `$NAMESPACE` — a full clean
 run (the default) still deletes the namespace and the PVC with it; pass `--skip-clean`
 to reuse a populated cache across reruns.
+
+## Optimized Baseline Quick-start (pd-test namespace)
+
+A simplified P/D disaggregation stack for single-node testing. The [`optimized-baseline/`](./optimized-baseline/) directory contains scripts to deploy, calibrate, monitor, and optionally autoscale:
+
+```bash
+# 1. Deploy the stack
+export HF_TOKEN="your_token"
+./optimized-baseline/deploy-pd-test-optimized-baseline.sh
+
+# 2. Test metrics and health
+./optimized-baseline/test-metrics.sh
+./optimized-baseline/test-metrics.sh --probe 60            # with load
+
+# 3. Calibrate peakPrefillThroughput (REQUIRED for autoscaling)
+NAMESPACE=pd-test GUIDE_NAME=optimized-baseline ./calibrate-peak-prefill.sh --apply
+
+# 4. (Optional) Enable token-aware autoscaling with KEDA
+./optimized-baseline/launch-scaledobject.sh
+./optimized-baseline/launch-scaledobject.sh --max 8 --vp 2665  # customize
+
+# 5. (Cleanup) Remove all resources from pd-test namespace
+./cleanup-namespace.sh
+```
+
+**Shared scripts** (work for both P/D disaggregation and optimized-baseline):
+- `./calibrate-peak-prefill.sh` — measure peakPrefillThroughput (set `NAMESPACE` + `GUIDE_NAME` env vars)
+- `./cleanup-namespace.sh` — remove all resources from a namespace (set `NAMESPACE` env var)
+
+For options and detailed configuration, see script help: `./optimized-baseline/deploy-pd-test-optimized-baseline.sh --help`.
 
 ## Upstream gaps found while testing this (unreported as of 2026-08-18, llm-d @ main)
 
