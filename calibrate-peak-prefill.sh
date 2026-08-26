@@ -135,7 +135,7 @@ preflight() {
     || die "upstream Job template missing at ${CAL_DIR}/calibration-peak-throughput.yaml"
   info "upstream tool: $(cd "$LLMD_DIR" && git log -1 --format='%h %ad' --date=short 2>/dev/null) ${CAL_DIR#$PWD/}/calibrate.sh"
 
-  kubectl auth whoami >/dev/null 2>&1 || die "not authenticated to the cluster. Run your 'oc login ...'."
+  kubectl get ns default >/dev/null 2>&1 || die "not authenticated to the cluster. Run your 'oc login ...'."
   kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 || die "namespace ${NAMESPACE} does not exist"
 
   # The Job talks to the EPP service, so the whole P/D path must be serving —

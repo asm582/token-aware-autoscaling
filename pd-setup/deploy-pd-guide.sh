@@ -47,8 +47,8 @@
 #    what is being tested stays the guide and not a rewrite of it. Each of those
 #    is exposed as an environment variable below if it needs to move.
 #
-# NOT IN SCOPE: monitoring, KEDA ScaledObjects, calibrate.sh, benchmarking. This
-# script deploys the guide and verifies it serves. The EPP keeps the guide's
+# NOT IN SCOPE: KEDA ScaledObjects, calibrate.sh, benchmarking. This script
+# deploys the guide, enables monitoring, and verifies it serves. The EPP keeps the guide's
 # peakPrefillThroughput=33821, which upstream measured on H200/gpt-oss-120b and
 # which is therefore NOT the right figure for Qwen3-32B on H100 — it affects
 # prefix-affinity routing decisions, not whether the stack works.
@@ -193,10 +193,10 @@ preflight() {
   # Credentials. An expired OCP token surfaces as "the server has asked for the
   # client to provide credentials" from every subsequent call, so fail here with
   # something actionable instead of 40 lines of memcache noise.
-  local who
-  who=$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null) \
+  kubectl get ns default >/dev/null 2>&1 \
     || die "not authenticated to the cluster. Run your 'oc login ...' and retry."
-  [[ -n $who ]] || die "not authenticated to the cluster. Run your 'oc login ...' and retry."
+  local who
+  who=$(oc whoami 2>/dev/null || kubectl config view --minify -o jsonpath='{.contexts[0].context.user}' 2>/dev/null || echo "unknown")
   ok "authenticated as ${who} @ $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 
   # Cluster-scoped prerequisites: asserted, never installed. The standalone
@@ -902,7 +902,114 @@ apply_modelserver() {
 }
 
 # =========================================================================
-# STAGE 7 — wait for readiness
+# STAGE 7b — monitoring (PodMonitors + EPP ServiceMonitor)
+# =========================================================================
+enable_monitoring() {
+  stage "STAGE 7b  monitoring (PodMonitors + EPP ServiceMonitor)"
+  [[ $DRY_RUN == true ]] && { warn "--dry-run: not applying monitoring resources"; return 0; }
+
+  # OpenShift User Workload Monitoring only discovers ServiceMonitors/PodMonitors
+  # in namespaces with this label.
+  run kubectl label namespace "$NAMESPACE" openshift.io/user-monitoring=true --overwrite \
+    || warn "could not label namespace for user-workload-monitoring"
+
+  # vLLM PodMonitors: one per role. The upstream kustomize component
+  # (components/monitoring-pd) carries both, but its commonlabels config injects
+  # extra selectors we don't control. Apply them directly with the labels the
+  # guide's model server already sets (llm-d.ai/role).
+  for role in prefill decode; do
+    cat <<EOPM | run kubectl apply -n "$NAMESPACE" -f -
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ${role}-podmonitor
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    matchLabels:
+      llm-d.ai/role: ${role}
+  podMetricsEndpoints:
+    - port: modelserver
+      path: /metrics
+      interval: 30s
+EOPM
+  done
+  ok "PodMonitors: prefill-podmonitor, decode-podmonitor"
+
+  # The EPP uses controller-runtime's secure metrics serving, which validates
+  # callers via SubjectAccessReview. The EPP SA needs tokenreviews + SAR create
+  # permissions, and the scraping SA needs get /metrics. The helm chart's
+  # ClusterRole has all three but may be bound to a generated SA name that
+  # differs from the deployment's SA; ensure the deployment SA has them too.
+  local epp_sa epp_cr
+  epp_sa=$(kubectl get deploy "${GUIDE_NAME}-epp" -n "$NAMESPACE" \
+             -o jsonpath='{.spec.template.spec.serviceAccountName}' 2>/dev/null)
+  epp_cr=$(kubectl get clusterrole -o name 2>/dev/null \
+             | grep -m1 "${NAMESPACE}.*epp" | cut -d/ -f2)
+  if [[ -n $epp_sa && -n $epp_cr ]]; then
+    cat <<EOCRB | run kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${GUIDE_NAME}-${NAMESPACE}-epp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ${epp_cr}
+subjects:
+  - kind: ServiceAccount
+    name: ${epp_sa}
+    namespace: ${NAMESPACE}
+EOCRB
+    ok "EPP SA ${epp_sa} bound to ClusterRole ${epp_cr}"
+  else
+    warn "could not detect EPP SA (${epp_sa:-?}) or ClusterRole (${epp_cr:-?}); skipping CRB"
+  fi
+
+  # Create a token secret for the EPP SA so the ServiceMonitor can authenticate.
+  cat <<EOSEC | run kubectl apply -n "$NAMESPACE" -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${GUIDE_NAME}-epp-token
+  namespace: ${NAMESPACE}
+  annotations:
+    kubernetes.io/service-account.name: ${epp_sa:-${GUIDE_NAME}-epp}
+type: kubernetes.io/service-account-token
+EOSEC
+  ok "EPP SA token secret: ${GUIDE_NAME}-epp-token"
+
+  # EPP ServiceMonitor: created directly rather than layering monitoring.values.yaml
+  # into the helm install. Reason: calibrate-peak-prefill.sh does a helm upgrade
+  # without that file, which would silently drop a chart-managed ServiceMonitor.
+  # A directly-applied resource survives helm upgrades of the router.
+  cat <<EOSM | run kubectl apply -n "$NAMESPACE" -f -
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ${GUIDE_NAME}-epp-monitor
+  namespace: ${NAMESPACE}
+spec:
+  endpoints:
+    - interval: 10s
+      port: http-metrics
+      path: /metrics
+      authorization:
+        credentials:
+          key: token
+          name: ${GUIDE_NAME}-epp-token
+  namespaceSelector:
+    matchNames:
+      - ${NAMESPACE}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ${GUIDE_NAME}-epp
+EOSM
+  ok "ServiceMonitor: ${GUIDE_NAME}-epp-monitor (with bearer auth)"
+}
+
+# =========================================================================
+# STAGE 8 — wait for readiness
 # =========================================================================
 wait_ready() {
   stage "STAGE 8  wait for pods (timeout ${ROLLOUT_TIMEOUT}s)"
@@ -1160,6 +1267,7 @@ summary() {
    model:      ${MODEL}
    topology:   prefill ${PREFILL_REPLICAS} x TP=${PREFILL_TP} + decode ${DECODE_REPLICAS} x TP=${DECODE_TP} = ${TOTAL_GPUS} GPU
    router:     standalone (EPP + envoy sidecar), release "${GUIDE_NAME}"
+   monitoring: PodMonitors (prefill + decode) + ServiceMonitor (EPP)
    model cache: ${cache_line}
    artifacts:  ${WORKDIR}/
                  modelserver.rendered.yaml   exactly what was applied
@@ -1193,6 +1301,7 @@ main() {
   install_router
   render_overlay
   apply_modelserver
+  enable_monitoring
   wait_ready
   verify
   summary

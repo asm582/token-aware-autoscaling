@@ -14,8 +14,17 @@ rendered.yaml
 # test-metric-flow.sh --probe timelines
 timeline-*.csv
 
+# test-metrics.sh --probe timelines (optimized-baseline)
+metrics-timeline-*.csv
+
 # run-benchmark.sh output (GBs per run) and its `latest` symlink
 benchmark-results/
 
 # experiment run outputs (reports, timelines, metrics per run)
 experiments/
+
+# local Claude Code session state (not part of the guide)
+.claude/
+
+# upstream llm-d/llm-d-benchmark clone (has its own git history; not vendored here)
+/llm-d-benchmark/
