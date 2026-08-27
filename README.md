@@ -1,17 +1,27 @@
-# Token-aware autoscaling on llm-d P/D
+# Token-aware autoscaling on llm-d
 
-Five scripts that deploy the upstream [llm-d P/D disaggregation
-guide](https://github.com/llm-d/llm-d/tree/main/guides/pd-disaggregation), measure the one
-hardware-specific constant the design needs, arm token-aware KEDA autoscaling on both roles,
-prove the trigger metrics actually reach KEDA, and benchmark the result — plus a staged
-workload that exercises the autoscaler end to end.
+Scripts that deploy an llm-d inference stack, measure the one hardware-specific constant the
+design needs, arm token-aware KEDA autoscaling, prove the trigger metrics actually reach KEDA,
+and benchmark the result — plus staged workloads that exercise the autoscaler end to end.
+
+**Two deployment topologies are covered, sharing the same token-velocity design:**
+
+| Path | Topology | Scripts |
+|---|---|---|
+| **P/D disaggregation** | prefill and decode on separate pods ([upstream guide](https://github.com/llm-d/llm-d/tree/main/guides/pd-disaggregation)) | [`pd-setup/`](./pd-setup/) |
+| **Optimized baseline** | co-located `kv_both`, single `InferencePool`, one Deployment | [`optimized-baseline/`](./optimized-baseline/) |
+
+Shared across both: [`calibrate-peak-prefill.sh`](./calibrate-peak-prefill.sh) (measures the
+constant), [`benchmark/run-benchmark.sh`](./benchmark/run-benchmark.sh),
+[`workloads/`](./workloads/), and [`cleanup-namespace.sh`](./cleanup-namespace.sh).
 
 The design is described in [TOKEN-AWARE-AUTOSCALING-SUMMARY.md](TOKEN-AWARE-AUTOSCALING-SUMMARY.md).
 Read that first — it explains *why* prefill divides tokens by a token rate and decode does
-not, which is the part that makes the thresholds mean something.
+not (§1–§7 for P/D, §8 for the co-located variant), which is the part that makes the thresholds
+mean something.
 
-Everything here was run end to end on OpenShift 4.x / k8s 1.32, H100-80GB, Qwen3-32B at
-prefill 1×TP2 + decode 1×TP2.
+Everything here was run end to end on OpenShift 4.x / k8s 1.32, H100-80GB, Qwen3-32B (P/D at
+prefill 1×TP2 + decode 1×TP2; optimized baseline at 1×TP2 co-located).
 
 ## Prerequisites
 
@@ -20,15 +30,15 @@ if something is missing.
 
 | Requirement | Why | Check |
 |---|---|---|
-| `kubectl`, `helm`, `kustomize`, `python3` (+ `pyyaml`), `git`, `envsubst` | client tooling | `deploy-pd-guide.sh` stage 0 |
+| `kubectl`, `helm`, `kustomize`, `python3` (+ `pyyaml`), `git`, `envsubst` | client tooling | `pd-setup/deploy-pd-guide.sh` stage 0 |
 | GAIE CRDs, `InferencePool` **v1** | the router chart renders an InferencePool | `kubectl get crd inferencepools.inference.networking.k8s.io` |
 | Kubernetes **≥ 1.29** | the decode routing sidecar is a native sidecar (initContainer + `restartPolicy: Always`) | `kubectl version` |
-| GPUs free **on one node per pod** | tensor parallelism is intra-node: a TP=N pod needs N free GPUs on a single node | `deploy-pd-guide.sh` bin-packs and reports |
+| GPUs free **on one node per pod** | tensor parallelism is intra-node: a TP=N pod needs N free GPUs on a single node | `pd-setup/deploy-pd-guide.sh` bin-packs and reports |
 | KEDA / Custom Metrics Autoscaler | runs the ScaledObjects | `kubectl get crd scaledobjects.keda.sh` |
 | Prometheus user-workload monitoring + Thanos Querier | where the trigger queries run | `kubectl get pods -n openshift-user-workload-monitoring` |
 | Permission to create a `ClusterRoleBinding` | KEDA→Thanos needs a `cluster-monitoring-view` binding | `kubectl auth can-i create clusterrolebinding` |
-| `llmdbenchmark` CLI + the `llm-d-benchmark` checkout | only for `run-benchmark.sh`; also supplies the `config/` and `workload/` trees | `llmdbenchmark --version` |
-| `oc` (OpenShift CLI) | `launch-scaledobjects.sh` uses it throughout; the Thanos/`service-ca` auth path is OpenShift-specific | `oc whoami` |
+| `llmdbenchmark` CLI + the `llm-d-benchmark` checkout | only for `benchmark/run-benchmark.sh`; also supplies the `config/` and `workload/` trees | `llmdbenchmark --version` |
+| `oc` (OpenShift CLI) | `pd-setup/launch-scaledobjects.sh` uses it throughout; the Thanos/`service-ca` auth path is OpenShift-specific | `oc whoami` |
 
 Install the benchmark CLI with:
 
@@ -39,41 +49,42 @@ cd llm-d-benchmark && source .venv/bin/activate
 
 `LLMD_DIR` controls where the llm-d checkout lives. By default the scripts use `./llm-d`,
 falling back to `../llm-d` if that already exists, and cloning if neither does. Point it
-anywhere: `LLMD_DIR=/path/to/llm-d ./deploy-pd-guide.sh`.
+anywhere: `LLMD_DIR=/path/to/llm-d ./pd-setup/deploy-pd-guide.sh`.
 
-## Run order
+## Run order (P/D disaggregation)
+
+For the co-located path, see [Optimized baseline quick-start](#optimized-baseline-quick-start-pd-test-namespace) below.
 
 ```bash
 # 1. deploy the upstream guide (clean namespace -> router -> model servers -> verify)
-./deploy-pd-guide.sh                        # ~6 min; --render-only needs no cluster
+./pd-setup/deploy-pd-guide.sh               # ~6 min; --render-only needs no cluster
 
 # 2. enable monitoring — REQUIRED before step 4, see "Monitoring" below
 
 # 3. measure peakPrefillThroughput on YOUR hardware, and apply it to the EPP
-./calibrate-peak-prefill.sh --decompose     # measure + split prefill vs KV-transfer cost
-./calibrate-peak-prefill.sh --apply         # measure, patch the EPP, verify it took
-#    (or from optimized-baseline: ./optimized-baseline/calibrate-peak-prefill.sh)
+./calibrate-peak-prefill.sh                  # measure only
+./calibrate-peak-prefill.sh --apply          # measure, patch the EPP, verify it took
 
 # 4. arm the two ScaledObjects
-./launch-scaledobjects.sh --vp <measured> --max 4
+./pd-setup/launch-scaledobjects.sh --vp <measured> --max 4
 
 # 5. prove the metrics reach KEDA
-./test-metric-flow.sh                       # read-only health check
-./test-metric-flow.sh --probe 180           # drive load, prove the values MOVE (may scale)
+./pd-setup/test-metric-flow.sh              # read-only health check
+./pd-setup/test-metric-flow.sh --probe 180  # drive load, prove the values MOVE (may scale)
 
 # 6. benchmark, or run the staged autoscaling experiment
-./run-benchmark.sh                                              # guide's latency profile
-./run-benchmark.sh --workload-file workloads/pd-autoscaling-ramp.yaml   # 57-min staged ramp
-./run-benchmark.sh --workload-file workloads/pd-autoscaling-ramp.yaml --pause-autoscaling
+./benchmark/run-benchmark.sh                                              # guide's latency profile
+./benchmark/run-benchmark.sh --workload-file workloads/pd-autoscaling-ramp.yaml   # 57-min staged ramp
+./benchmark/run-benchmark.sh --workload-file workloads/pd-autoscaling-ramp.yaml --pause-autoscaling
                                                                 # same load, fixed fleet (baseline)
 ```
 
-Teardown: `./deploy-pd-guide.sh --teardown` (releases the GPUs) and
-`./launch-scaledobjects.sh --delete`.
+Teardown: `./pd-setup/deploy-pd-guide.sh --teardown` (releases the GPUs) and
+`./pd-setup/launch-scaledobjects.sh --delete`.
 
 ## The scripts
 
-### `deploy-pd-guide.sh`
+### `pd-setup/deploy-pd-guide.sh`
 Deploys the guide by its own path — `helm install llm-d-router-standalone` plus a kustomize
 overlay — not through llm-d-benchmark. Eight stage-gated stages, each asserting a
 postcondition rather than trusting an exit code. Verifies disaggregation actually happened
@@ -88,26 +99,26 @@ Wraps upstream `guides/recipes/router/calibration/calibrate.sh` unmodified, addi
 guards whose absence makes its output silently wrong: `CHUNK_SIZE` verified against the
 effective `--max-num-batched-tokens` read from each prefill pod's own startup log; an idle
 gate before and after (queue wait inside TTFT understates throughput); repeats with the
-run-to-run spread reported. `--decompose` additionally measures the prefill pod directly
-via upstream's `VLLM_ENDPOINT` override, splitting prefill compute from the P/D KV hop.
-`--apply` rewrites `peakPrefillThroughput` (which lives inside a YAML string no `--set` can
-reach), upgrades, restarts the EPP, and re-reads the live ConfigMap to confirm.
+run-to-run spread reported. `--apply` rewrites `peakPrefillThroughput` (which lives inside a
+YAML string no `--set` can reach), upgrades, restarts the EPP, and re-reads the live ConfigMap
+to confirm. Shared by both paths — set `NAMESPACE` and `GUIDE_NAME` to target the co-located
+stack (`GUIDE_NAME=optimized-baseline`).
 
-### `launch-scaledobjects.sh`
+### `pd-setup/launch-scaledobjects.sh`
 Creates the KEDA auth chain (metrics-reader SA + `cluster-monitoring-view` binding + token
 Secret + `TriggerAuthentication`) and the two ScaledObjects from the summary's §4.
 Deployment and InferencePool names are **discovered**, not hardcoded. `--decode-signal`
 selects the summary's occupancy trigger (default) or the refused-admission variant; the
 default threshold follows the signal because they are different units.
 
-### `test-metric-flow.sh`
+### `pd-setup/test-metric-flow.sh`
 Reads the queries **out of the live ScaledObjects** rather than keeping its own copy, and
 queries Thanos with the **metrics-reader ServiceAccount's own token** — the exact credential
 KEDA uses. Both choices are deliberate: a test with its own copy of the PromQL passes while
 KEDA runs something else, and a test using your `oc whoami -t` succeeds where the SA may
 not. `--probe N` drives load and writes a timeline CSV proving the values move.
 
-### `run-benchmark.sh`
+### `benchmark/run-benchmark.sh`
 Benchmarks the already-deployed stack with `llm-d-benchmark`, **run-only** — it never calls
 `standup`/`teardown`, so it cannot redeploy or disturb the stack. Follows the guide's
 documented path (`--endpoint-url` + `--gateway-class epponly`; without the latter the CLI
@@ -141,11 +152,9 @@ up past the single-replica KV ceiling and back. Because generations are long, se
 `request_timeout` above `OSL × steady-ITL` — see the bite below.
 
 `experiments/` holds the report and the small artifacts from runs worth keeping. Start with
-[`experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-18-staged-ramp/EXPERIMENT-REPORT.md):
-both triggers fired (prefill peaked 10.76 vs threshold 1.5, decode 0.994 vs 0.8), the fleet
-went 4 → 12 GPUs and back — and it documents three defects found in the process.
-[`experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md)
-repeats it with `--model-cache` and `V_P = 2696` (fleet 4 → 14 GPUs) and ties the run to its
+[`experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md`](experiments/2026-08-20-staged-ramp/EXPERIMENT-REPORT.md):
+run with `--model-cache` and `V_P = 2696`, both triggers fired (prefill peaked 131.7 vs threshold
+1.5, decode 1.891 vs 0.8), the fleet went 4 → 14 GPUs and back, and it ties the run to its
 analysis charts, below.
 [`experiments/2026-08-20-prefill-heavy/EXPERIMENT-REPORT.md`](experiments/2026-08-20-prefill-heavy/EXPERIMENT-REPORT.md)
 runs the prefill-heavy workload (ISL 8192 / OSL 256): prefill pegged at the cap, the TTFT knee
@@ -211,7 +220,7 @@ observed 26.9s backlog asks for `ceil(26.9/1.5)` = 18 replicas; the same load at
 **`llm_d_epp_inflight_tokens` is registered lazily on the first dispatched request.** A
 freshly restarted EPP has no such series, and the query's `or vector(0)` renders that as a
 confident zero — indistinguishable from "no backlog". Send traffic before trusting the
-trigger. `test-metric-flow.sh` reports *absent* separately from *zero* for this reason.
+trigger. `pd-setup/test-metric-flow.sh` reports *absent* separately from *zero* for this reason.
 
 **The prefill trigger flaps under steady load.** `llm_d_epp_inflight_tokens` is an
 *instantaneous* gauge and the query does no time-averaging, so at `pollingInterval: 15` most
@@ -245,14 +254,19 @@ client requests are unaffected). It is opt-in and scoped to `$NAMESPACE` — a f
 run (the default) still deletes the namespace and the PVC with it; pass `--skip-clean`
 to reuse a populated cache across reruns.
 
-## Optimized Baseline Quick-start (pd-test namespace)
+## Optimized baseline quick-start (pd-test namespace)
 
-A simplified P/D disaggregation stack for single-node testing. The [`optimized-baseline/`](./optimized-baseline/) directory contains scripts to deploy, calibrate, monitor, and optionally autoscale:
+The **co-located** topology: prefill and decode run together on one model-server Deployment
+(`kv_role: kv_both`) behind a single `InferencePool` — *not* P/D disaggregation. One KEDA
+`ScaledObject` carries both token-aware triggers and scales the one Deployment to the max of the
+two (see [summary §8](TOKEN-AWARE-AUTOSCALING-SUMMARY.md)). The
+[`optimized-baseline/`](./optimized-baseline/) directory holds scripts to deploy, calibrate,
+monitor, and optionally autoscale:
 
 ```bash
 # 1. Deploy the stack
-export HF_TOKEN="your_token"
-./optimized-baseline/deploy-pd-test-optimized-baseline.sh
+export HF_TOKEN="your_token"                               # optional for ungated models
+./optimized-baseline/deploy-optimized-baseline.sh
 
 # 2. Test metrics and health
 ./optimized-baseline/test-metrics.sh
@@ -261,11 +275,11 @@ export HF_TOKEN="your_token"
 # 3. Calibrate peakPrefillThroughput (REQUIRED for autoscaling)
 NAMESPACE=pd-test GUIDE_NAME=optimized-baseline ./calibrate-peak-prefill.sh --apply
 
-# 4. (Optional) Enable token-aware autoscaling with KEDA
-./optimized-baseline/launch-scaledobject.sh
+# 4. (Optional) Enable token-aware autoscaling with KEDA (single ScaledObject, both triggers)
+./optimized-baseline/launch-scaledobject.sh                # discovers V_P from the EPP ConfigMap
 ./optimized-baseline/launch-scaledobject.sh --max 8 --vp 2665  # customize
 
-# 5. (Cleanup) Remove all resources from pd-test namespace
+# 5. (Cleanup) Remove all resources from pd-test namespace (preserves the model PVC)
 ./cleanup-namespace.sh
 ```
 
@@ -273,7 +287,7 @@ NAMESPACE=pd-test GUIDE_NAME=optimized-baseline ./calibrate-peak-prefill.sh --ap
 - `./calibrate-peak-prefill.sh` — measure peakPrefillThroughput (set `NAMESPACE` + `GUIDE_NAME` env vars)
 - `./cleanup-namespace.sh` — remove all resources from a namespace (set `NAMESPACE` env var)
 
-For options and detailed configuration, see script help: `./optimized-baseline/deploy-pd-test-optimized-baseline.sh --help`.
+For options and detailed configuration, see script help: `./optimized-baseline/deploy-optimized-baseline.sh --help`.
 
 ## Upstream gaps found while testing this (unreported as of 2026-08-18, llm-d @ main)
 
